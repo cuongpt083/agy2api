@@ -76,7 +76,8 @@ export function ChatPage() {
         },
         body: JSON.stringify({
           model: 'Gemini 3.6 Flash (High)',
-          messages: updatedMessages
+          messages: updatedMessages,
+          stream: true
         })
       });
 
@@ -84,9 +85,56 @@ export function ChatPage() {
         throw new Error(`API Error: ${response.status}`);
       }
 
-      const data = await response.json();
-      const assistantMsg: Message = data.choices[0].message;
-      setMessages(prev => [...prev, assistantMsg]);
+      if (!response.body) {
+        throw new Error('Streaming is not supported in this browser');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let assistantContent = '';
+      let started = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          let json: any;
+          try {
+            json = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          if (json.error) {
+            throw new Error(json.error.message || 'Stream error');
+          }
+          const delta = json.choices?.[0]?.delta?.content;
+          if (!delta) continue;
+          assistantContent += delta;
+          if (!started) {
+            started = true;
+            setMessages(prev => [...prev, { role: 'assistant', content: assistantContent }]);
+          } else {
+            const snapshot = assistantContent;
+            setMessages(prev => {
+              const copy = [...prev];
+              copy[copy.length - 1] = { role: 'assistant', content: snapshot };
+              return copy;
+            });
+          }
+        }
+      }
+
+      if (!started) {
+        setMessages(prev => [...prev, { role: 'assistant', content: assistantContent || '(empty response)' }]);
+      }
 
     } catch (err: any) {
       setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${err.message}` }]);

@@ -39,6 +39,8 @@ Gửi yêu cầu chat hoặc yêu cầu phân tích file/hình ảnh đến mô 
 
 **Endpoint:** `POST /v1/chat/completions`
 
+- `stream` (optional, default `false`): `true` thì API trả **SSE** (`text/event-stream`) tương thích OpenAI (`data: {chunk}` … `data: [DONE]`). Proxy đọc `agy --output-format stream-json` và chỉ forward `text_delta` của `agent_response`.
+
 ### Trường hợp 1: Chat Text bình thường
 **Request Body:**
 ```json
@@ -80,7 +82,34 @@ Gửi yêu cầu chat hoặc yêu cầu phân tích file/hình ảnh đến mô 
 }
 ```
 
-**Response Example:**
+### Trường hợp 3: Streaming (SSE)
+**Request Body:**
+```json
+{
+  "model": "Gemini 3.6 Flash (High)",
+  "stream": true,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Viết cho tôi một hàm Python tính Fibonacci"
+    }
+  ]
+}
+```
+
+**Response:** `Content-Type: text/event-stream`
+
+```
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","created":1786102866,"model":"Gemini 3.6 Flash (High)","choices":[{"index":0,"delta":{"role":"assistant","content":"def "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","created":1786102866,"model":"Gemini 3.6 Flash (High)","choices":[{"index":0,"delta":{"content":"fib(n):"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","created":1786102866,"model":"Gemini 3.6 Flash (High)","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10415,"completion_tokens":657,"total_tokens":11072}}
+
+data: [DONE]
+```
+
+**Response Example (stream=false):**
 ```json
 {
   "id": "chatcmpl-0d1ea4851363",

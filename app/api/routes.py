@@ -7,8 +7,16 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 from pydantic import BaseModel, Field
 from app.api.models import ChatCompletionRequest, ChatCompletionResponse, Choice, ChoiceMessage, Usage, ModelList, Model, SpeechRequest
 from app.core.security import get_api_key
-from app.core.agy_runner import run_agy_prompt
+from app.core.agy_runner import run_agy_prompt, stream_agy_prompt
+from app.core.openai_sse import (
+    extract_agent_text_delta,
+    format_sse,
+    next_text_delta,
+    openai_chunk,
+    usage_from_agy,
+)
 import logging
+import re
 from app.core.file_handler import TempFileManager
 from app.core.capcut_api import AsyncCapCutWrapper
 from app.core.model_manager import get_available_models
@@ -49,20 +57,37 @@ async def list_models(api_key: str = Depends(get_api_key)):
     models = await get_available_models()
     return ModelList(data=models)
 
-@router.post("/chat/completions", response_model=ChatCompletionResponse, summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs.")
-async def chat_completions(req: ChatCompletionRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
-    logger.info(f"Processing chat completions for model: {req.model}")
-    file_mgr = TempFileManager()
-    background_tasks.add_task(file_mgr.cleanup)
-    
+def _ext_from_data_uri(url: str) -> str:
+    ext = ".png"
+    match = re.match(r"^data:([^/]+)/([^;,]+)", url)
+    if not match:
+        return ext
+    mime_sub = match.group(2).lower()
+    if mime_sub in ["jpeg", "jpg"]:
+        return ".jpg"
+    if mime_sub == "pdf":
+        return ".pdf"
+    if mime_sub == "msword":
+        return ".doc"
+    if "wordprocessingml" in mime_sub:
+        return ".docx"
+    if mime_sub == "plain":
+        return ".txt"
+    if mime_sub == "csv":
+        return ".csv"
+    if mime_sub in ["png", "gif", "webp"]:
+        return f".{mime_sub}"
+    return f".{mime_sub}"
+
+
+def build_chat_prompt(req: ChatCompletionRequest, file_mgr: TempFileManager) -> tuple[str, list[str]]:
     prompt_lines = []
     files_to_attach = []
-    
+
     for msg in req.messages:
         if isinstance(msg.content, str):
             prompt_lines.append(f"{msg.role.capitalize()}: {msg.content}")
         elif isinstance(msg.content, list):
-            # Parse mixed content (text + image_url)
             text_parts = []
             for p in msg.content:
                 if p.get("type") == "text":
@@ -70,19 +95,7 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
                 elif p.get("type") == "image_url":
                     url = p.get("image_url", {}).get("url", "")
                     if url.startswith("data:"):
-                        import re
-                        ext = ".png"
-                        match = re.match(r'^data:([^/]+)/([^;,]+)', url)
-                        if match:
-                            mime_sub = match.group(2).lower()
-                            if mime_sub in ['jpeg', 'jpg']: ext = ".jpg"
-                            elif mime_sub == 'pdf': ext = ".pdf"
-                            elif mime_sub == 'msword': ext = ".doc"
-                            elif 'wordprocessingml' in mime_sub: ext = ".docx"
-                            elif mime_sub == 'plain': ext = ".txt"
-                            elif mime_sub == 'csv': ext = ".csv"
-                            elif mime_sub in ['png', 'gif', 'webp']: ext = f".{mime_sub}"
-                            else: ext = f".{mime_sub}"
+                        ext = _ext_from_data_uri(url)
                         try:
                             fpath = file_mgr.add_base64_file(url, ext=ext)
                             files_to_attach.append(fpath)
@@ -92,28 +105,102 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
                     else:
                         text_parts.append(f"[Image URL: {url}]")
             prompt_lines.append(f"{msg.role.capitalize()}: {' '.join(text_parts)}")
-            
+
     prompt_lines.append("Assistant: ")
-    final_prompt = "\n".join(prompt_lines)
-    
-    # We pass the files list to agy_runner if we want to use --add-dir or something similar,
-    # but since we already injected paths into the prompt, agy's vision might pick it up automatically if it can read local files.
-    agy_response = await run_agy_prompt(prompt=final_prompt, model=req.model, files=files_to_attach)
-    
-    assistant_text = ""
+    return "\n".join(prompt_lines), files_to_attach
+
+
+def _assistant_text(agy_response) -> str:
     if isinstance(agy_response, dict):
-        assistant_text = agy_response.get("text") or agy_response.get("content") or agy_response.get("response") or str(agy_response)
-    else:
-        assistant_text = str(agy_response)
-        
-    response = ChatCompletionResponse(
+        return agy_response.get("text") or agy_response.get("content") or agy_response.get("response") or str(agy_response)
+    return str(agy_response)
+
+
+async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, file_mgr: TempFileManager):
+    sent = ""
+    role_sent = False
+    try:
+        async for event in stream_agy_prompt(prompt=prompt, model=model):
+            piece, sent = extract_agent_text_delta(event, sent)
+            if piece:
+                delta = {"content": piece}
+                if not role_sent:
+                    delta["role"] = "assistant"
+                    role_sent = True
+                yield format_sse(openai_chunk(chat_id, created, model, delta))
+            if event.get("event") != "result":
+                continue
+            result = event.get("result") or {}
+            final_text = result.get("response") or result.get("text") or ""
+            piece, sent = next_text_delta(final_text, sent)
+            if piece:
+                delta = {"content": piece}
+                if not role_sent:
+                    delta["role"] = "assistant"
+                    role_sent = True
+                yield format_sse(openai_chunk(chat_id, created, model, delta))
+            yield format_sse(
+                openai_chunk(
+                    chat_id,
+                    created,
+                    model,
+                    {},
+                    finish_reason="stop",
+                    usage=usage_from_agy(result.get("usage")),
+                )
+            )
+        yield format_sse("[DONE]")
+    except Exception as e:
+        logger.error("AGY stream failed: %s", e, exc_info=True)
+        err = {
+            "error": {
+                "message": str(e),
+                "type": "server_error",
+            }
+        }
+        yield format_sse(err)
+        yield format_sse("[DONE]")
+    finally:
+        file_mgr.cleanup()
+
+
+@router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE.")
+async def chat_completions(req: ChatCompletionRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
+    logger.info(f"Processing chat completions for model: {req.model} stream={req.stream}")
+    file_mgr = TempFileManager()
+    final_prompt, files_to_attach = build_chat_prompt(req, file_mgr)
+
+    if req.stream:
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+        return StreamingResponse(
+            _sse_chat_stream(final_prompt, req.model, chat_id, created, file_mgr),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    background_tasks.add_task(file_mgr.cleanup)
+    agy_response = await run_agy_prompt(prompt=final_prompt, model=req.model, files=files_to_attach)
+    assistant_text = _assistant_text(agy_response)
+    usage_data = Usage()
+    if isinstance(agy_response, dict) and agy_response.get("usage"):
+        mapped = usage_from_agy(agy_response.get("usage"))
+        usage_data = Usage(
+            prompt_tokens=mapped["prompt_tokens"],
+            completion_tokens=mapped["completion_tokens"],
+            total_tokens=mapped["total_tokens"],
+        )
+    return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
         created=int(time.time()),
         model=req.model,
         choices=[Choice(message=ChoiceMessage(content=assistant_text))],
-        usage=Usage()
+        usage=usage_data,
     )
-    return response
 
 @router.post("/images/generations", response_model=ImageGenerationResponse, summary="Image Generations", description="Creates an image given a prompt using the AGY artist skills.")
 async def generate_image(req: ImageGenerationRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):

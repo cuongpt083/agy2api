@@ -9,20 +9,24 @@ client = OpenAI(
 )
 
 def main():
-    print("Sending chat completion request to AGY2API...")
+    print("Sending streaming chat completion request to AGY2API...")
     
-    # You can specify "Gemini 3.6 Flash (High)" or any other supported model
-    response = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model="Gemini 3.6 Flash (High)",
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Write a short haiku about coding."}
-        ]
+        ],
+        stream=True,
     )
 
     print("\nResponse:")
     print("-" * 20)
-    print(response.choices[0].message.content)
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if delta:
+            print(delta, end="", flush=True)
+    print()
     print("-" * 20)
 
 if __name__ == "__main__":

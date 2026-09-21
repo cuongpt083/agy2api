@@ -7,6 +7,7 @@ services:
       - "8000:8000"
     environment:
       - AGY_API_KEY=sk-dummy
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     # Mount local gemini config if agy is running inside docker
     volumes:
       - ~/.gemini:/root/.gemini

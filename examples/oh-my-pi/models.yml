@@ -1,0 +1,45 @@
+# Oh-My-Pi custom provider for AGY2API's Gemini function-calling path.
+# Copy into ~/.omp/agent/models.yml (merge under `providers:`).
+#
+# OMP runs tools locally. AGY2API translates OpenAI tools ↔ Gemini
+# functionDeclarations. Do not point this at Antigravity OAuth / `agy`.
+#
+# Required on the AGY2API host:
+#   AGY_API_KEY     — wrapper auth (Authorization: Bearer)
+#   GEMINI_API_KEY  — Google AI Studio / Gemini API key
+
+providers:
+  agy2api:
+    baseUrl: http://localhost:8000/v1
+    api: openai-completions
+    apiKey: AGY_API_KEY
+    authHeader: true
+    models:
+      - id: gemini-3.7-flash-high
+        name: Gemini 3.7 Flash (High)
+        reasoning: true
+        input: [text, image]
+        contextWindow: 1000000
+        maxTokens: 65536
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        compat:
+          supportsDeveloperRole: false
+          supportsReasoningEffort: true
+          supportsStore: false
+          supportsToolChoice: true
+          maxTokensField: max_tokens
+          supportsUsageInStreaming: true
+      - id: gemini-2.5-flash
+        name: Gemini 2.5 Flash
+        reasoning: true
+        input: [text, image]
+        contextWindow: 1000000
+        maxTokens: 65536
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        compat:
+          supportsDeveloperRole: false
+          supportsReasoningEffort: true
+          supportsStore: false
+          supportsToolChoice: true
+          maxTokensField: max_tokens
+          supportsUsageInStreaming: true

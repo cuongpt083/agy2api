@@ -161,6 +161,16 @@ In **Cursor Settings > Models**:
 2. Enter your `AGY_API_KEY`.
 3. Add custom model names (e.g., `Gemini 3.6 Flash (High)`).
 
+## 🧰 Oh-My-Pi / Pi (OpenAI tools)
+
+When `POST /v1/chat/completions` includes `tools`, AGY2API does **not** call `agy`. It translates OpenAI function calling to the official Gemini API (`generateContent`) so Oh-My-Pi (and Pi) can execute tools locally.
+
+1. Set `GEMINI_API_KEY` (Google AI Studio) on the AGY2API host, in addition to `AGY_API_KEY`.
+2. Use a `gemini-*` model id (for example `gemini-3.7-flash-high` or `gemini-2.5-flash`). Claude/GPT slugs on Antigravity are not available on this path.
+3. Point Oh-My-Pi at `http://localhost:8000/v1` with the example config in [`examples/oh-my-pi/models.yml`](examples/oh-my-pi/models.yml).
+
+Thought signatures required by Gemini 3 function calling are returned as `tool_calls[].extra_content.google.thought_signature` and cached server-side if the client strips unknown fields.
+
 ## 🎨 Developing the UI (Optional)
 
 <p align="center">

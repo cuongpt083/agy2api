@@ -8,6 +8,15 @@ from pydantic import BaseModel, Field
 from app.api.models import ChatCompletionRequest, ChatCompletionResponse, Choice, ChoiceMessage, Usage, ModelList, Model, SpeechRequest
 from app.core.security import get_api_key
 from app.core.agy_runner import run_agy_prompt, stream_agy_prompt
+from app.core import gemini_client
+from app.core.gemini_client import GeminiAPIError, gemini_api_key
+from app.core.openai_gemini import (
+    GeminiSseEncoder,
+    SIGNATURE_CACHE,
+    build_gemini_request,
+    gemini_candidate_to_openai_choice,
+    usage_from_gemini,
+)
 from app.core.openai_sse import (
     extract_agent_text_delta,
     format_sse,
@@ -164,9 +173,99 @@ async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, 
         file_mgr.cleanup()
 
 
-@router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE.")
+def _openai_error(message: str, status_code: int = 400, err_type: str = "invalid_request_error", code: Optional[str] = None) -> JSONResponse:
+    body: dict = {"error": {"message": message, "type": err_type}}
+    if code:
+        body["error"]["code"] = code
+    return JSONResponse(status_code=status_code, content=body)
+
+
+async def _gemini_sse_chat_stream(call, echo_model: str):
+    encoder = GeminiSseEncoder(
+        chat_id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        created=int(time.time()),
+        model=echo_model,
+        signatures=SIGNATURE_CACHE,
+    )
+    try:
+        async for event in gemini_client.stream_generate_content(
+            call.model, call.body, gemini_api_key()
+        ):
+            for frame in encoder.feed(event):
+                yield frame
+        for frame in encoder.close():
+            yield frame
+    except GeminiAPIError as e:
+        logger.error("Gemini stream failed: %s", e.message)
+        yield format_sse(e.openai_error())
+        yield format_sse("[DONE]")
+    except Exception as e:
+        logger.error("Gemini stream failed: %s", e, exc_info=True)
+        yield format_sse({"error": {"message": str(e), "type": "server_error"}})
+        yield format_sse("[DONE]")
+
+
+async def _gemini_chat_completions(req: ChatCompletionRequest):
+    key = gemini_api_key()
+    if not key:
+        return _openai_error(
+            "GEMINI_API_KEY is required when tools are present. "
+            "Set GEMINI_API_KEY to use Oh-My-Pi / OpenAI function calling via the Gemini API.",
+            code="missing_gemini_api_key",
+        )
+    try:
+        call = build_gemini_request(req.model_dump(), SIGNATURE_CACHE)
+    except ValueError as e:
+        return _openai_error(str(e))
+
+    if req.stream:
+        return StreamingResponse(
+            _gemini_sse_chat_stream(call, req.model),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    try:
+        result = await gemini_client.generate_content(call.model, call.body, key)
+    except GeminiAPIError as e:
+        return JSONResponse(status_code=min(e.status_code, 599) or 502, content=e.openai_error())
+
+    candidates = result.get("candidates") or [{}]
+    mapped = gemini_candidate_to_openai_choice(candidates[0], SIGNATURE_CACHE)
+    usage_data = Usage()
+    if result.get("usageMetadata"):
+        usage_mapped = usage_from_gemini(result["usageMetadata"])
+        usage_data = Usage(
+            prompt_tokens=usage_mapped["prompt_tokens"],
+            completion_tokens=usage_mapped["completion_tokens"],
+            total_tokens=usage_mapped["total_tokens"],
+        )
+    return ChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        created=int(time.time()),
+        model=req.model,
+        choices=[
+            Choice(
+                message=ChoiceMessage(
+                    content=mapped["message"].get("content"),
+                    tool_calls=mapped["message"].get("tool_calls"),
+                ),
+                finish_reason=mapped["finish_reason"],
+            )
+        ],
+        usage=usage_data,
+    )
+
+
+@router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE. When `tools` is set, the request is served by the Gemini API (function calling) rather than agy.")
 async def chat_completions(req: ChatCompletionRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
     logger.info(f"Processing chat completions for model: {req.model} stream={req.stream}")
+    if req.tools:
+        return await _gemini_chat_completions(req)
     file_mgr = TempFileManager()
     final_prompt, files_to_attach = build_chat_prompt(req, file_mgr)
 

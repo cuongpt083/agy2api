@@ -114,6 +114,31 @@ class TestEventsToSse(unittest.TestCase):
         # Verify reasoning_tokens in usage
         self.assertTrue(any('"reasoning_tokens": 8' in d for d in decoded))
 
+    def test_content_arriving_first_still_emits_reasoning_before_content(self):
+        events = [
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "ACTIVE",
+                    "text_delta": "The answer is 4.",
+                },
+            },
+            {
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "The answer is 4.",
+                    "reasoning_content": "I added 2 and 2.",
+                },
+            },
+        ]
+        decoded = [f.decode("utf-8") for f in events_to_sse_bytes(events, "id", 1, "m")]
+        reasoning_idx = next(i for i, d in enumerate(decoded) if "reasoning_content" in d)
+        content_idx = next(i for i, d in enumerate(decoded) if '"content":' in d)
+        self.assertLess(reasoning_idx, content_idx)
+        self.assertFalse(any('"content":' in d for d in decoded[:reasoning_idx]))
+
     def test_thinking_delta_emits_reasoning_before_content(self):
         events = [
             {"event": "thinking_delta", "thinking_delta": "I will add 2 and 2."},

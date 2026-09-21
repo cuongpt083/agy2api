@@ -1,5 +1,5 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
@@ -37,6 +37,7 @@ class SseStreamState:
     sent: str = ""
     sent_reasoning: str = ""
     role_sent: bool = False
+    pending_content: list[str] = field(default_factory=list)
 
 
 def sse_frames_for_event(
@@ -46,7 +47,11 @@ def sse_frames_for_event(
     created: int,
     model: str,
 ) -> list[bytes]:
-    """Map one agy stream event to OpenAI SSE frames. Reasoning is emitted before content."""
+    """Map one agy stream event to OpenAI SSE frames.
+
+    Reasoning is streamed immediately. Official answer `content` is buffered
+    until `result` so CoT always precedes the user-visible reply.
+    """
     frames: list[bytes] = []
     rpiece, state.sent_reasoning = extract_reasoning_delta(event, state.sent_reasoning)
     if rpiece:
@@ -57,22 +62,21 @@ def sse_frames_for_event(
         frames.append(format_sse(openai_chunk(chat_id, created, model, delta)))
     piece, state.sent = extract_agent_text_delta(event, state.sent)
     if piece:
-        delta = {"content": piece}
-        if not state.role_sent:
-            delta["role"] = "assistant"
-            state.role_sent = True
-        frames.append(format_sse(openai_chunk(chat_id, created, model, delta)))
+        state.pending_content.append(piece)
     if event.get("event") != "result":
         return frames
     result = event.get("result") or {}
     final_text = result.get("response") or result.get("text") or ""
-    piece, state.sent = next_text_delta(final_text, state.sent)
-    if piece:
-        delta = {"content": piece}
+    leftover, state.sent = next_text_delta(final_text, state.sent)
+    if leftover:
+        state.pending_content.append(leftover)
+    for text in state.pending_content:
+        delta = {"content": text}
         if not state.role_sent:
             delta["role"] = "assistant"
             state.role_sent = True
         frames.append(format_sse(openai_chunk(chat_id, created, model, delta)))
+    state.pending_content.clear()
     frames.append(
         format_sse(
             openai_chunk(

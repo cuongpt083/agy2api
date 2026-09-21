@@ -41,8 +41,7 @@ class TestAgyRunnerEffort(unittest.TestCase):
             effort="high",
         )
         try:
-            self.assertIn("--effort", inv.cmd)
-            self.assertIn("high", inv.cmd)
+            self.assertNotIn("--effort", inv.cmd)
             self.assertIn("--model", inv.cmd)
             self.assertIn("gemini-3.7-flash-high", inv.cmd)
         finally:

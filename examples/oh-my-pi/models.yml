@@ -3,6 +3,10 @@
 #
 # OMP may send OpenAI `tools`; AGY2API ignores them and runs `agy`
 # with AGY's own tools. Only AGY_API_KEY is required on the host.
+#
+# Pick effort via the AGY model id suffix (-low/-medium/-high), not OMP's
+# thinking slider. supportsReasoningEffort is false so OMP does not send
+# reasoning_effort=minimal on top of a -high slug (agy rejects that).
 
 providers:
   agy2api:
@@ -11,6 +15,20 @@ providers:
     apiKey: AGY_API_KEY
     authHeader: true
     models:
+      - id: gemini-3.8-flash-high
+        name: Gemini 3.8 Flash (High)
+        reasoning: true
+        input: [text, image]
+        contextWindow: 1000000
+        maxTokens: 65536
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        compat:
+          supportsDeveloperRole: false
+          supportsReasoningEffort: false
+          supportsStore: false
+          supportsToolChoice: true
+          maxTokensField: max_tokens
+          supportsUsageInStreaming: true
       - id: gemini-3.7-flash-high
         name: Gemini 3.7 Flash (High)
         reasoning: true
@@ -20,7 +38,7 @@ providers:
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         compat:
           supportsDeveloperRole: false
-          supportsReasoningEffort: true
+          supportsReasoningEffort: false
           supportsStore: false
           supportsToolChoice: true
           maxTokensField: max_tokens
@@ -34,7 +52,7 @@ providers:
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         compat:
           supportsDeveloperRole: false
-          supportsReasoningEffort: true
+          supportsReasoningEffort: false
           supportsStore: false
           supportsToolChoice: true
           maxTokensField: max_tokens

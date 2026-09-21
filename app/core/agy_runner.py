@@ -2,12 +2,36 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# OpenAI / OMP send reasoning_effort in {minimal,low,medium,high,xhigh,max}.
+# agy --effort only accepts low|medium|high. Model slugs already encode the
+# level (gemini-3.8-flash-high); passing a second --effort conflicts or is invalid.
+_OPENAI_TO_AGY_EFFORT = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+_MODEL_EFFORT_SUFFIX = re.compile(r"-(low|medium|high)$", re.IGNORECASE)
+_MODEL_EFFORT_DISPLAY = re.compile(r"\((Low|Medium|High)\)$")
+
+
+def resolve_agy_effort(model: str | None, effort: str | None) -> str | None:
+    """Return an agy --effort value, or None to omit the flag."""
+    if model and (_MODEL_EFFORT_SUFFIX.search(model.strip()) or _MODEL_EFFORT_DISPLAY.search(model.strip())):
+        return None
+    if not effort:
+        return None
+    return _OPENAI_TO_AGY_EFFORT.get(effort.strip().lower())
 
 # Linux rejects a single argv string over MAX_ARG_STRLEN (128 KiB).
 # Never pass the chat/RAG prompt as --print <prompt>.
@@ -82,8 +106,9 @@ def build_agy_invocation(
     ]
     if model:
         cmd.extend(["--model", model])
-    if effort:
-        cmd.extend(["--effort", effort])
+    resolved_effort = resolve_agy_effort(model, effort)
+    if resolved_effort:
+        cmd.extend(["--effort", resolved_effort])
     return AgyInvocation(cmd=cmd, prompt_dir=prompt_dir, prompt_path=prompt_path)
 
 

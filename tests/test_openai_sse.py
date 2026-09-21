@@ -83,5 +83,36 @@ class TestEventsToSse(unittest.TestCase):
         self.assertFalse(any("should not leak" in d for d in decoded))
 
 
+    def test_maps_reasoning_content(self):
+        events = [
+            {"event": "init", "conversation_id": "test-conv-123"},
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "DONE",
+                    "text_delta": "The answer is 4.",
+                },
+            },
+            {
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "The answer is 4.",
+                    "reasoning_content": "Step 1: 2+2=4. Step 2: verify.",
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "thinking_tokens": 8, "total_tokens": 15},
+                },
+            },
+        ]
+        frames = list(events_to_sse_bytes(events, "chatcmpl-test", 1, "test-model"))
+        decoded = [f.decode("utf-8") for f in frames]
+        # Verify content delta
+        self.assertTrue(any('"content": "The answer is 4."' in d for d in decoded))
+        # Verify reasoning_content chunk is emitted
+        self.assertTrue(any('"reasoning_content": "Step 1: 2+2=4. Step 2: verify."' in d for d in decoded))
+        # Verify reasoning_tokens in usage
+        self.assertTrue(any('"reasoning_tokens": 8' in d for d in decoded))
+
+
 if __name__ == "__main__":
     unittest.main()

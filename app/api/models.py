@@ -94,6 +94,7 @@ class ChoiceMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
     role: str = "assistant"
     content: Optional[str] = None
+    reasoning_content: Optional[str] = Field(None, description="Reasoning or chain-of-thought content")
     tool_calls: Optional[List[Dict[str, Any]]] = None
 
 class Choice(BaseModel):
@@ -105,6 +106,7 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    completion_tokens_details: Optional[Dict[str, Any]] = None
 
 class ChatCompletionResponse(BaseModel):
     id: str

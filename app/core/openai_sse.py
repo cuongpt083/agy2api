@@ -29,11 +29,16 @@ def usage_from_agy(usage: Optional[dict]) -> dict:
     prompt = int(usage.get("input_tokens") or 0)
     completion = int(usage.get("output_tokens") or 0)
     total = int(usage.get("total_tokens") or (prompt + completion))
-    return {
+    res = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
     }
+    if usage.get("thinking_tokens") is not None:
+        res["completion_tokens_details"] = {
+            "reasoning_tokens": int(usage.get("thinking_tokens") or 0)
+        }
+    return res
 
 
 def openai_chunk(
@@ -86,6 +91,10 @@ def events_to_sse_bytes(events: list[dict], chat_id: str, created: int, model: s
             result = event.get("result") or {}
 
     if result is not None:
+        reasoning = result.get("reasoning_content")
+        if reasoning:
+            yield format_sse(openai_chunk(chat_id, created, model, {"reasoning_content": reasoning}))
+
         final_text = result.get("response") or result.get("text") or ""
         piece, sent = next_text_delta(final_text, sent)
         if piece:

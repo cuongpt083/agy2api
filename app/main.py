@@ -30,9 +30,9 @@ async def agy_garbage_collector():
                     if os.path.isdir(folder_path):
                         if now - os.path.getmtime(folder_path) > max_age_seconds:
                             shutil.rmtree(folder_path, ignore_errors=True)
-                            print(f"[Garbage Collector] Deleted old conversation log: {folder}")
+                            logger.info(f"[Garbage Collector] Deleted old conversation log: {folder}")
         except Exception as e:
-            print(f"[Garbage Collector] Error cleaning up: {e}")
+            logger.error(f"[Garbage Collector] Error cleaning up: {e}")
             
         await asyncio.sleep(6 * 3600)  # Sleep for 6 hours
 

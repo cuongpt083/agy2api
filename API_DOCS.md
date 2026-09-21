@@ -39,9 +39,7 @@ Gửi yêu cầu chat hoặc yêu cầu phân tích file/hình ảnh đến mô 
 
 **Endpoint:** `POST /v1/chat/completions`
 
-- `stream` (optional, default `false`): `true` thì API trả **SSE** (`text/event-stream`) tương thích OpenAI (`data: {chunk}` … `data: [DONE]`).
-- Mọi request chat đều gọi `agy`. Proxy đọc `agy --output-format stream-json`, forward `text_delta` của `agent_response`, và poll transcript để stream `reasoning_content` (trước `content` khi có CoT).
-- Client có thể gửi `tools` (ví dụ Oh-My-Pi). Trường này được chấp nhận nhưng **bỏ qua**; AGY dùng bộ tool của chính nó. Không cần `GEMINI_API_KEY`.
+- `stream` (optional, default `false`): `true` thì API trả **SSE** (`text/event-stream`) tương thích OpenAI (`data: {chunk}` … `data: [DONE]`). Proxy đọc `agy --output-format stream-json` và chỉ forward `text_delta` của `agent_response`.
 
 ### Trường hợp 1: Chat Text bình thường
 **Request Body:**

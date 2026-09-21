@@ -161,12 +161,6 @@ In **Cursor Settings > Models**:
 2. Enter your `AGY_API_KEY`.
 3. Add custom model names (e.g., `Gemini 3.6 Flash (High)`).
 
-## 🧰 Oh-My-Pi / Pi (OpenAI tools)
-
-Oh-My-Pi (and Pi) may send OpenAI `tools` on `POST /v1/chat/completions`. AGY2API **accepts** that field so the client does not fail schema validation, but it **does not** forward those tools. The request still goes to `agy`, which uses its own tool surface. No `GEMINI_API_KEY` is required.
-
-Point Oh-My-Pi at `http://localhost:8000/v1` with the example config in [`examples/oh-my-pi/models.yml`](examples/oh-my-pi/models.yml) and authenticate with `AGY_API_KEY`.
-
 ## 🎨 Developing the UI (Optional)
 
 <p align="center">

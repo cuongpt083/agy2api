@@ -1,5 +1,4 @@
 import json
-from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
@@ -24,90 +23,17 @@ def extract_agent_text_delta(event: dict, sent: str) -> tuple[str, str]:
     return next_text_delta(step.get("text_delta") or "", sent)
 
 
-def extract_reasoning_delta(event: dict, sent: str) -> tuple[str, str]:
-    if event.get("event") == "thinking_delta":
-        return next_text_delta(event.get("thinking_delta") or "", sent)
-    if event.get("event") == "result":
-        return next_text_delta((event.get("result") or {}).get("reasoning_content") or "", sent)
-    return "", sent
-
-
-@dataclass
-class SseStreamState:
-    sent: str = ""
-    sent_reasoning: str = ""
-    role_sent: bool = False
-    pending_content: list[str] = field(default_factory=list)
-
-
-def sse_frames_for_event(
-    event: dict,
-    state: SseStreamState,
-    chat_id: str,
-    created: int,
-    model: str,
-) -> list[bytes]:
-    """Map one agy stream event to OpenAI SSE frames.
-
-    Reasoning is streamed immediately. Official answer `content` is buffered
-    until `result` so CoT always precedes the user-visible reply.
-    """
-    frames: list[bytes] = []
-    rpiece, state.sent_reasoning = extract_reasoning_delta(event, state.sent_reasoning)
-    if rpiece:
-        delta: dict[str, Any] = {"reasoning_content": rpiece}
-        if not state.role_sent:
-            delta["role"] = "assistant"
-            state.role_sent = True
-        frames.append(format_sse(openai_chunk(chat_id, created, model, delta)))
-    piece, state.sent = extract_agent_text_delta(event, state.sent)
-    if piece:
-        state.pending_content.append(piece)
-    if event.get("event") != "result":
-        return frames
-    result = event.get("result") or {}
-    final_text = result.get("response") or result.get("text") or ""
-    leftover, state.sent = next_text_delta(final_text, state.sent)
-    if leftover:
-        state.pending_content.append(leftover)
-    for text in state.pending_content:
-        delta = {"content": text}
-        if not state.role_sent:
-            delta["role"] = "assistant"
-            state.role_sent = True
-        frames.append(format_sse(openai_chunk(chat_id, created, model, delta)))
-    state.pending_content.clear()
-    frames.append(
-        format_sse(
-            openai_chunk(
-                chat_id,
-                created,
-                model,
-                {},
-                finish_reason="stop",
-                usage=usage_from_agy(result.get("usage")),
-            )
-        )
-    )
-    return frames
-
-
 def usage_from_agy(usage: Optional[dict]) -> dict:
     if not usage:
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     prompt = int(usage.get("input_tokens") or 0)
     completion = int(usage.get("output_tokens") or 0)
     total = int(usage.get("total_tokens") or (prompt + completion))
-    res = {
+    return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
     }
-    if usage.get("thinking_tokens") is not None:
-        res["completion_tokens_details"] = {
-            "reasoning_tokens": int(usage.get("thinking_tokens") or 0)
-        }
-    return res
 
 
 def openai_chunk(
@@ -144,7 +70,42 @@ def format_sse(payload: Any) -> bytes:
 
 def events_to_sse_bytes(events: list[dict], chat_id: str, created: int, model: str):
     """Pure mapping used by the route and unit tests."""
-    state = SseStreamState()
+    sent = ""
+    role_sent = False
+    result = None
+
     for event in events:
-        yield from sse_frames_for_event(event, state, chat_id, created, model)
+        piece, sent = extract_agent_text_delta(event, sent)
+        if piece:
+            delta = {"content": piece}
+            if not role_sent:
+                delta["role"] = "assistant"
+                role_sent = True
+            yield format_sse(openai_chunk(chat_id, created, model, delta))
+        if event.get("event") == "result":
+            result = event.get("result") or {}
+
+    if result is not None:
+        final_text = result.get("response") or result.get("text") or ""
+        piece, sent = next_text_delta(final_text, sent)
+        if piece:
+            delta = {"content": piece}
+            if not role_sent:
+                delta["role"] = "assistant"
+                role_sent = True
+            yield format_sse(openai_chunk(chat_id, created, model, delta))
+
+        status = (result.get("status") or "SUCCESS").upper()
+        finish = "stop" if status == "SUCCESS" else "stop"
+        yield format_sse(
+            openai_chunk(
+                chat_id,
+                created,
+                model,
+                {},
+                finish_reason=finish,
+                usage=usage_from_agy(result.get("usage")),
+            )
+        )
+
     yield format_sse("[DONE]")

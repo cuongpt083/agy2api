@@ -1,23 +1,12 @@
 version: "3.8"
 
 services:
-  agy-api:
+  api:
     build: .
-    container_name: agy-api
-    restart: unless-stopped
     ports:
-      - "8686:8686"
-    networks:
-      - study
+      - "8000:8000"
     environment:
       - AGY_API_KEY=sk-dummy
-    # Mount local agy binary, gemini config, persistent data, and app code
+    # Mount local gemini config if agy is running inside docker
     volumes:
-      - ~/.local/bin/agy:/usr/local/bin/agy:ro
       - ~/.gemini:/root/.gemini
-      - ./data:/app/data
-      - ./app:/app/app
-networks:
-  study:
-    external: true
-

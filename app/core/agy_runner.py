@@ -2,40 +2,12 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.core.openai_sse import next_text_delta
-
 logger = logging.getLogger(__name__)
-
-_THINKING_POLL_SECONDS = 0.25
-
-# OpenAI / OMP send reasoning_effort in {minimal,low,medium,high,xhigh,max}.
-# agy --effort only accepts low|medium|high. Model slugs already encode the
-# level (gemini-3.8-flash-high); passing a second --effort conflicts or is invalid.
-_OPENAI_TO_AGY_EFFORT = {
-    "minimal": "low",
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "xhigh": "high",
-    "max": "high",
-}
-_MODEL_EFFORT_SUFFIX = re.compile(r"-(low|medium|high)$", re.IGNORECASE)
-_MODEL_EFFORT_DISPLAY = re.compile(r"\((Low|Medium|High)\)$")
-
-
-def resolve_agy_effort(model: str | None, effort: str | None) -> str | None:
-    """Return an agy --effort value, or None to omit the flag."""
-    if model and (_MODEL_EFFORT_SUFFIX.search(model.strip()) or _MODEL_EFFORT_DISPLAY.search(model.strip())):
-        return None
-    if not effort:
-        return None
-    return _OPENAI_TO_AGY_EFFORT.get(effort.strip().lower())
 
 # Linux rejects a single argv string over MAX_ARG_STRLEN (128 KiB).
 # Never pass the chat/RAG prompt as --print <prompt>.
@@ -52,47 +24,10 @@ class AgyInvocation:
         shutil.rmtree(self.prompt_dir, ignore_errors=True)
 
 
-def extract_thinking_from_brain(conversation_id: str | None) -> str | None:
-    """Extract reasoning/chain-of-thought from the AGY brain transcript for a given conversation_id."""
-    if not conversation_id:
-        return None
-    brain_dir = os.environ.get("AGY_BRAIN_DIR", os.path.expanduser("~/.gemini/antigravity-cli/brain"))
-    transcript_path = os.path.join(brain_dir, conversation_id, ".system_generated", "logs", "transcript_full.jsonl")
-    if not os.path.isfile(transcript_path):
-        transcript_path = os.path.join(brain_dir, conversation_id, ".system_generated", "logs", "transcript.jsonl")
-        if not os.path.isfile(transcript_path):
-            return None
-
-    thinkings = []
-    try:
-        with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    th = data.get("thinking")
-                    if th and isinstance(th, str) and th.strip():
-                        thinkings.append(th.strip())
-                except json.JSONDecodeError:
-                    continue
-    except Exception as e:
-        logger.warning("Failed to extract thinking for %s: %s", conversation_id, e)
-    return "\n\n".join(thinkings) if thinkings else None
-
-
-def next_brain_thinking_delta(conversation_id: str | None, sent: str) -> tuple[str, str]:
-    """Return newly observed brain thinking since `sent` (cumulative transcript)."""
-    full = extract_thinking_from_brain(conversation_id) or ""
-    return next_text_delta(full, sent)
-
-
 def build_agy_invocation(
     prompt: str,
     model: str | None,
     output_format: str,
-    effort: str | None = None,
 ) -> AgyInvocation:
     prompt_dir = tempfile.mkdtemp(prefix="agy2api-prompt-")
     prompt_path = str(Path(prompt_dir) / _PROMPT_FILENAME)
@@ -116,9 +51,6 @@ def build_agy_invocation(
     ]
     if model:
         cmd.extend(["--model", model])
-    resolved_effort = resolve_agy_effort(model, effort)
-    if resolved_effort:
-        cmd.extend(["--effort", resolved_effort])
     return AgyInvocation(cmd=cmd, prompt_dir=prompt_dir, prompt_path=prompt_path)
 
 
@@ -158,11 +90,11 @@ async def _drain_stderr(process: asyncio.subprocess.Process) -> bytes:
     return b"".join(chunks)
 
 
-async def run_agy_prompt(prompt: str, model: str = None, output_format: str = "json", files: list[str] = None, effort: str = None):
+async def run_agy_prompt(prompt: str, model: str = None, output_format: str = "json", files: list[str] = None):
     """
     Safely executes the `agy` CLI using asyncio subprocess to avoid blocking.
     """
-    inv = build_agy_invocation(prompt, model, output_format, effort=effort)
+    inv = build_agy_invocation(prompt, model, output_format)
     _log_agy_cmd(inv, "command")
     try:
         process = await asyncio.create_subprocess_exec(
@@ -183,13 +115,7 @@ async def run_agy_prompt(prompt: str, model: str = None, output_format: str = "j
         output_str = stdout.decode().strip()
 
         try:
-            parsed = _parse_json_envelope(output_str)
-            if isinstance(parsed, dict):
-                conv_id = parsed.get("conversation_id")
-                thinking = extract_thinking_from_brain(conv_id)
-                if thinking:
-                    parsed["reasoning_content"] = thinking
-            return parsed
+            return _parse_json_envelope(output_str)
         except json.JSONDecodeError:
             logger.error(f"Failed to parse AGY JSON output: {output_str}")
             return {"text": output_str}
@@ -197,15 +123,12 @@ async def run_agy_prompt(prompt: str, model: str = None, output_format: str = "j
         inv.cleanup()
 
 
-async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = None, effort: str = None):
+async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = None):
     """Yield parsed NDJSON events from `agy --output-format stream-json`."""
-    inv = build_agy_invocation(prompt, model, "stream-json", effort=effort)
+    inv = build_agy_invocation(prompt, model, "stream-json")
     _log_agy_cmd(inv, "stream")
     process = None
     stderr_task = None
-    read_task = None
-    conv_id = None
-    sent_thinking = ""
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
@@ -213,50 +136,16 @@ async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = N
             stderr=asyncio.subprocess.PIPE,
         )
         stderr_task = asyncio.create_task(_drain_stderr(process))
-        read_task = asyncio.create_task(process.stdout.readline())
-
-        def _thinking_event():
-            nonlocal sent_thinking
-            piece, sent_thinking = next_brain_thinking_delta(conv_id, sent_thinking)
-            if not piece:
-                return None
-            return {"event": "thinking_delta", "thinking_delta": piece}
 
         while True:
-            done, _ = await asyncio.wait({read_task}, timeout=_THINKING_POLL_SECONDS)
-            if not done:
-                ev = _thinking_event()
-                if ev:
-                    yield ev
-                continue
-            line = read_task.result()
+            line = await process.stdout.readline()
             if not line:
-                ev = _thinking_event()
-                if ev:
-                    yield ev
                 break
-            read_task = asyncio.create_task(process.stdout.readline())
             text = line.decode(errors="replace").strip()
             if not text:
                 continue
             try:
-                event_data = json.loads(text)
-                if event_data.get("event") == "init":
-                    conv_id = event_data.get("conversation_id") or (
-                        (event_data.get("init") or {}).get("conversation_id")
-                    )
-                elif event_data.get("event") == "result":
-                    res = event_data.get("result") or {}
-                    c_id = res.get("conversation_id") or conv_id
-                    if c_id:
-                        conv_id = c_id
-                    thinking = extract_thinking_from_brain(c_id)
-                    if thinking:
-                        event_data.setdefault("result", {})["reasoning_content"] = thinking
-                ev = _thinking_event()
-                if ev:
-                    yield ev
-                yield event_data
+                yield json.loads(text)
             except json.JSONDecodeError:
                 logger.warning("Skipping non-JSON AGY stream line: %s", text[:200])
 
@@ -267,12 +156,6 @@ async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = N
             logger.error(f"AGY Error: {error_msg}")
             raise RuntimeError(f"AGY CLI execution failed: {error_msg}")
     finally:
-        if read_task is not None and not read_task.done():
-            read_task.cancel()
-            try:
-                await read_task
-            except (asyncio.CancelledError, Exception):
-                pass
         if process is not None and process.returncode is None:
             process.kill()
             await process.wait()

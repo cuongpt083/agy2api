@@ -1,45 +1,18 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
 
-class FunctionSpec(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    name: str
-    description: Optional[str] = None
-    parameters: Optional[Dict[str, Any]] = None
-
-class ToolSpec(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    type: Optional[str] = "function"
-    function: Optional[FunctionSpec] = None
-
-class ToolCallFunction(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    name: str
-    arguments: Optional[str] = "{}"
-
-class ToolCall(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    id: Optional[str] = None
-    type: Optional[str] = "function"
-    function: Optional[ToolCallFunction] = None
-    extra_content: Optional[Dict[str, Any]] = None
-    index: Optional[int] = None
-
 class Message(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    role: str = Field(..., description="The role of the messages author, e.g. user, assistant, system, or tool")
-    content: Optional[Union[str, List[Dict[str, Any]]]] = Field(
-        None,
-        description="The contents of the message. Can be a string, an array of content parts, or null when tool_calls is set.",
-    )
-    tool_calls: Optional[List[ToolCall]] = None
-    tool_call_id: Optional[str] = None
-    name: Optional[str] = None
+    role: str = Field(..., description="The role of the messages author, e.g. user, assistant, or system")
+    content: Union[str, List[Dict[str, Any]]] = Field(..., description="The contents of the message. Can be a string or an array of content parts (for multimodal inputs like images).")
 
 class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(
-        extra="allow",
-        json_schema_extra={
+    model: str = Field(..., description="ID of the model to use, e.g. 'Gemini 3.6 Flash (High)'")
+    messages: List[Message]
+    temperature: Optional[float] = Field(1.0, description="Sampling temperature")
+    stream: Optional[bool] = Field(False, description="Whether to stream back partial progress")
+
+    model_config = {
+        "json_schema_extra": {
             "description": "Để đính kèm file (hình ảnh, tài liệu pdf, docx, txt...), hãy sử dụng mảng content và truyền chuỗi base64 dạng data URI (vd: data:image/jpeg;base64,... hoặc data:application/pdf;base64,...) vào trường image_url. Mặc dù chuẩn gốc là image_url, hệ thống hỗ trợ phân giải tự động các loại file khác dựa vào mime type trong data URI.",
             "examples": [
                 {
@@ -79,23 +52,11 @@ class ChatCompletionRequest(BaseModel):
                 }
             ]
         }
-    )
-    model: str = Field(..., description="ID of the model to use, e.g. 'Gemini 3.6 Flash (High)'")
-    messages: List[Message]
-    temperature: Optional[float] = Field(1.0, description="Sampling temperature")
-    stream: Optional[bool] = Field(False, description="Whether to stream back partial progress")
-    tools: Optional[List[ToolSpec]] = Field(None, description="Accepted for OpenAI-compatible clients (e.g. Oh-My-Pi) but ignored. AGY uses its own tools.")
-    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
-    max_tokens: Optional[int] = None
-    max_completion_tokens: Optional[int] = None
-    reasoning_effort: Optional[str] = None
+    }
 
 class ChoiceMessage(BaseModel):
-    model_config = ConfigDict(extra="allow")
     role: str = "assistant"
-    content: Optional[str] = None
-    reasoning_content: Optional[str] = Field(None, description="Reasoning or chain-of-thought content")
-    tool_calls: Optional[List[Dict[str, Any]]] = None
+    content: str
 
 class Choice(BaseModel):
     index: int = 0
@@ -106,7 +67,6 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    completion_tokens_details: Optional[Dict[str, Any]] = None
 
 class ChatCompletionResponse(BaseModel):
     id: str

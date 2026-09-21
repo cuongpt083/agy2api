@@ -1,18 +1,18 @@
 import time
 import uuid
 import io
-from typing import List, Optional, Any
+from typing import List, Optional
 from fastapi import APIRouter, Depends, Request, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from pydantic import BaseModel, Field
 from app.api.models import ChatCompletionRequest, ChatCompletionResponse, Choice, ChoiceMessage, Usage, ModelList, Model, SpeechRequest
 from app.core.security import get_api_key
 from app.core.agy_runner import run_agy_prompt, stream_agy_prompt
-from app.core import dataset_writer
 from app.core.openai_sse import (
-    SseStreamState,
+    extract_agent_text_delta,
     format_sse,
-    sse_frames_for_event,
+    next_text_delta,
+    openai_chunk,
     usage_from_agy,
 )
 import logging
@@ -116,34 +116,39 @@ def _assistant_text(agy_response) -> str:
     return str(agy_response)
 
 
-async def _sse_chat_stream(
-    prompt: str,
-    model: str,
-    chat_id: str,
-    created: int,
-    file_mgr: TempFileManager,
-    effort: Optional[str] = None,
-    req_messages: Optional[List[Any]] = None,
-):
-    state = SseStreamState()
+async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, file_mgr: TempFileManager):
+    sent = ""
+    role_sent = False
     try:
-        async for event in stream_agy_prompt(prompt=prompt, model=model, effort=effort):
-            for frame in sse_frames_for_event(event, state, chat_id, created, model):
-                yield frame
+        async for event in stream_agy_prompt(prompt=prompt, model=model):
+            piece, sent = extract_agent_text_delta(event, sent)
+            if piece:
+                delta = {"content": piece}
+                if not role_sent:
+                    delta["role"] = "assistant"
+                    role_sent = True
+                yield format_sse(openai_chunk(chat_id, created, model, delta))
             if event.get("event") != "result":
                 continue
             result = event.get("result") or {}
-            reasoning = result.get("reasoning_content")
             final_text = result.get("response") or result.get("text") or ""
-            if reasoning:
-                dataset_writer.save_cot_turn(
-                    messages=req_messages or prompt,
-                    response_content=final_text,
-                    reasoning_content=reasoning,
-                    model=model,
-                    usage=result.get("usage"),
-                    conversation_id=result.get("conversation_id"),
+            piece, sent = next_text_delta(final_text, sent)
+            if piece:
+                delta = {"content": piece}
+                if not role_sent:
+                    delta["role"] = "assistant"
+                    role_sent = True
+                yield format_sse(openai_chunk(chat_id, created, model, delta))
+            yield format_sse(
+                openai_chunk(
+                    chat_id,
+                    created,
+                    model,
+                    {},
+                    finish_reason="stop",
+                    usage=usage_from_agy(result.get("usage")),
                 )
+            )
         yield format_sse("[DONE]")
     except Exception as e:
         logger.error("AGY stream failed: %s", e, exc_info=True)
@@ -159,11 +164,9 @@ async def _sse_chat_stream(
         file_mgr.cleanup()
 
 
-@router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE. Client `tools` are accepted but ignored; AGY uses its own tools.")
+@router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE.")
 async def chat_completions(req: ChatCompletionRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
     logger.info(f"Processing chat completions for model: {req.model} stream={req.stream}")
-    if req.tools:
-        logger.info("Ignoring client tools; AGY uses its own tool surface")
     file_mgr = TempFileManager()
     final_prompt, files_to_attach = build_chat_prompt(req, file_mgr)
 
@@ -171,15 +174,7 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         return StreamingResponse(
-            _sse_chat_stream(
-                final_prompt,
-                req.model,
-                chat_id,
-                created,
-                file_mgr,
-                effort=req.reasoning_effort,
-                req_messages=req.messages,
-            ),
+            _sse_chat_stream(final_prompt, req.model, chat_id, created, file_mgr),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -189,17 +184,8 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
         )
 
     background_tasks.add_task(file_mgr.cleanup)
-    agy_response = await run_agy_prompt(
-        prompt=final_prompt,
-        model=req.model,
-        files=files_to_attach,
-        effort=req.reasoning_effort,
-    )
+    agy_response = await run_agy_prompt(prompt=final_prompt, model=req.model, files=files_to_attach)
     assistant_text = _assistant_text(agy_response)
-    reasoning_text = None
-    if isinstance(agy_response, dict):
-        reasoning_text = agy_response.get("reasoning_content")
-
     usage_data = Usage()
     if isinstance(agy_response, dict) and agy_response.get("usage"):
         mapped = usage_from_agy(agy_response.get("usage"))
@@ -207,25 +193,12 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
             prompt_tokens=mapped["prompt_tokens"],
             completion_tokens=mapped["completion_tokens"],
             total_tokens=mapped["total_tokens"],
-            completion_tokens_details=mapped.get("completion_tokens_details"),
         )
-
-    if reasoning_text:
-        background_tasks.add_task(
-            dataset_writer.save_cot_turn,
-            messages=req.messages,
-            response_content=assistant_text,
-            reasoning_content=reasoning_text,
-            model=req.model,
-            usage=usage_data.model_dump(),
-            conversation_id=agy_response.get("conversation_id") if isinstance(agy_response, dict) else None,
-        )
-
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
         created=int(time.time()),
         model=req.model,
-        choices=[Choice(message=ChoiceMessage(content=assistant_text, reasoning_content=reasoning_text))],
+        choices=[Choice(message=ChoiceMessage(content=assistant_text))],
         usage=usage_data,
     )
 

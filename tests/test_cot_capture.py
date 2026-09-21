@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from app.api.models import ChoiceMessage, Choice, ChatCompletionResponse, Usage
-from app.core.agy_runner import build_agy_invocation, extract_thinking_from_brain
+from app.core.agy_runner import (
+    build_agy_invocation,
+    extract_thinking_from_brain,
+    next_brain_thinking_delta,
+)
 from app.core import dataset_writer
 
 
@@ -70,6 +74,20 @@ class TestExtractThinkingFromBrain(unittest.TestCase):
                 os.environ["AGY_BRAIN_DIR"] = tmpdir
                 thinking = extract_thinking_from_brain(conv_id)
                 self.assertEqual(thinking, "Calculation: 2 + 2 = 4.")
+
+                piece, sent = next_brain_thinking_delta(conv_id, "")
+                self.assertEqual(piece, "Calculation: 2 + 2 = 4.")
+                with open(transcript_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "content": "still 4",
+                        "thinking": "Confirming the sum.",
+                    }) + "\n")
+                piece, sent = next_brain_thinking_delta(conv_id, sent)
+                self.assertEqual(piece, "\n\nConfirming the sum.")
+                piece, sent = next_brain_thinking_delta(conv_id, sent)
+                self.assertEqual(piece, "")
             finally:
                 if orig_env is not None:
                     os.environ["AGY_BRAIN_DIR"] = orig_env

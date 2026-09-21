@@ -1,3 +1,4 @@
+import json
 import unittest
 from app.core.openai_sse import events_to_sse_bytes, next_text_delta
 
@@ -112,6 +113,53 @@ class TestEventsToSse(unittest.TestCase):
         self.assertTrue(any('"reasoning_content": "Step 1: 2+2=4. Step 2: verify."' in d for d in decoded))
         # Verify reasoning_tokens in usage
         self.assertTrue(any('"reasoning_tokens": 8' in d for d in decoded))
+
+    def test_thinking_delta_emits_reasoning_before_content(self):
+        events = [
+            {"event": "thinking_delta", "thinking_delta": "I will add 2 and 2."},
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "ACTIVE",
+                    "text_delta": "4",
+                },
+            },
+            {
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "4",
+                    "reasoning_content": "I will add 2 and 2.",
+                },
+            },
+        ]
+        decoded = [f.decode("utf-8") for f in events_to_sse_bytes(events, "id", 1, "m")]
+        reasoning_idx = next(i for i, d in enumerate(decoded) if "reasoning_content" in d)
+        content_idx = next(i for i, d in enumerate(decoded) if '"content": "4"' in d)
+        self.assertLess(reasoning_idx, content_idx)
+        reasoning_frames = [d for d in decoded if "reasoning_content" in d]
+        self.assertEqual(len(reasoning_frames), 1)
+        self.assertIn("I will add 2 and 2.", reasoning_frames[0])
+
+    def test_later_thinking_delta_does_not_repeat_prefix(self):
+        events = [
+            {"event": "thinking_delta", "thinking_delta": "First. "},
+            {"event": "thinking_delta", "thinking_delta": "First. Second."},
+            {
+                "event": "result",
+                "result": {"status": "SUCCESS", "response": "ok", "reasoning_content": "First. Second."},
+            },
+        ]
+        decoded = [f.decode("utf-8") for f in events_to_sse_bytes(events, "id", 1, "m")]
+        pieces = []
+        for line in decoded:
+            if "reasoning_content" not in line:
+                continue
+            payload = line[len("data: "):].strip()
+            chunk = json.loads(payload)
+            pieces.append(chunk["choices"][0]["delta"]["reasoning_content"])
+        self.assertEqual(pieces, ["First. ", "Second."])
 
 
 if __name__ == "__main__":

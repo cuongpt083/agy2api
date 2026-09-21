@@ -8,7 +8,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.core.openai_sse import next_text_delta
+
 logger = logging.getLogger(__name__)
+
+_THINKING_POLL_SECONDS = 0.25
 
 # OpenAI / OMP send reasoning_effort in {minimal,low,medium,high,xhigh,max}.
 # agy --effort only accepts low|medium|high. Model slugs already encode the
@@ -76,6 +80,12 @@ def extract_thinking_from_brain(conversation_id: str | None) -> str | None:
     except Exception as e:
         logger.warning("Failed to extract thinking for %s: %s", conversation_id, e)
     return "\n\n".join(thinkings) if thinkings else None
+
+
+def next_brain_thinking_delta(conversation_id: str | None, sent: str) -> tuple[str, str]:
+    """Return newly observed brain thinking since `sent` (cumulative transcript)."""
+    full = extract_thinking_from_brain(conversation_id) or ""
+    return next_text_delta(full, sent)
 
 
 def build_agy_invocation(
@@ -193,7 +203,9 @@ async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = N
     _log_agy_cmd(inv, "stream")
     process = None
     stderr_task = None
+    read_task = None
     conv_id = None
+    sent_thinking = ""
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
@@ -201,24 +213,49 @@ async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = N
             stderr=asyncio.subprocess.PIPE,
         )
         stderr_task = asyncio.create_task(_drain_stderr(process))
+        read_task = asyncio.create_task(process.stdout.readline())
+
+        def _thinking_event():
+            nonlocal sent_thinking
+            piece, sent_thinking = next_brain_thinking_delta(conv_id, sent_thinking)
+            if not piece:
+                return None
+            return {"event": "thinking_delta", "thinking_delta": piece}
 
         while True:
-            line = await process.stdout.readline()
+            done, _ = await asyncio.wait({read_task}, timeout=_THINKING_POLL_SECONDS)
+            if not done:
+                ev = _thinking_event()
+                if ev:
+                    yield ev
+                continue
+            line = read_task.result()
             if not line:
+                ev = _thinking_event()
+                if ev:
+                    yield ev
                 break
+            read_task = asyncio.create_task(process.stdout.readline())
             text = line.decode(errors="replace").strip()
             if not text:
                 continue
             try:
                 event_data = json.loads(text)
                 if event_data.get("event") == "init":
-                    conv_id = event_data.get("conversation_id")
+                    conv_id = event_data.get("conversation_id") or (
+                        (event_data.get("init") or {}).get("conversation_id")
+                    )
                 elif event_data.get("event") == "result":
                     res = event_data.get("result") or {}
                     c_id = res.get("conversation_id") or conv_id
+                    if c_id:
+                        conv_id = c_id
                     thinking = extract_thinking_from_brain(c_id)
                     if thinking:
                         event_data.setdefault("result", {})["reasoning_content"] = thinking
+                ev = _thinking_event()
+                if ev:
+                    yield ev
                 yield event_data
             except json.JSONDecodeError:
                 logger.warning("Skipping non-JSON AGY stream line: %s", text[:200])
@@ -230,6 +267,12 @@ async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = N
             logger.error(f"AGY Error: {error_msg}")
             raise RuntimeError(f"AGY CLI execution failed: {error_msg}")
     finally:
+        if read_task is not None and not read_task.done():
+            read_task.cancel()
+            try:
+                await read_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if process is not None and process.returncode is None:
             process.kill()
             await process.wait()

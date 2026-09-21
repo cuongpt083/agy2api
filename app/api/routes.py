@@ -10,10 +10,9 @@ from app.core.security import get_api_key
 from app.core.agy_runner import run_agy_prompt, stream_agy_prompt
 from app.core import dataset_writer
 from app.core.openai_sse import (
-    extract_agent_text_delta,
+    SseStreamState,
     format_sse,
-    next_text_delta,
-    openai_chunk,
+    sse_frames_for_event,
     usage_from_agy,
 )
 import logging
@@ -126,43 +125,16 @@ async def _sse_chat_stream(
     effort: Optional[str] = None,
     req_messages: Optional[List[Any]] = None,
 ):
-    sent = ""
-    role_sent = False
+    state = SseStreamState()
     try:
         async for event in stream_agy_prompt(prompt=prompt, model=model, effort=effort):
-            piece, sent = extract_agent_text_delta(event, sent)
-            if piece:
-                delta = {"content": piece}
-                if not role_sent:
-                    delta["role"] = "assistant"
-                    role_sent = True
-                yield format_sse(openai_chunk(chat_id, created, model, delta))
+            for frame in sse_frames_for_event(event, state, chat_id, created, model):
+                yield frame
             if event.get("event") != "result":
                 continue
             result = event.get("result") or {}
             reasoning = result.get("reasoning_content")
-            if reasoning:
-                yield format_sse(openai_chunk(chat_id, created, model, delta={"reasoning_content": reasoning}))
-
             final_text = result.get("response") or result.get("text") or ""
-            piece, sent = next_text_delta(final_text, sent)
-            if piece:
-                delta = {"content": piece}
-                if not role_sent:
-                    delta["role"] = "assistant"
-                    role_sent = True
-                yield format_sse(openai_chunk(chat_id, created, model, delta))
-            yield format_sse(
-                openai_chunk(
-                    chat_id,
-                    created,
-                    model,
-                    {},
-                    finish_reason="stop",
-                    usage=usage_from_agy(result.get("usage")),
-                )
-            )
-            # Auto-persist CoT turn to long-term dataset
             if reasoning:
                 dataset_writer.save_cot_turn(
                     messages=req_messages or prompt,

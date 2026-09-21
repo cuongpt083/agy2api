@@ -1,12 +1,8 @@
-# Oh-My-Pi custom provider for AGY2API's Gemini function-calling path.
+# Oh-My-Pi custom provider for AGY2API.
 # Copy into ~/.omp/agent/models.yml (merge under `providers:`).
 #
-# OMP runs tools locally. AGY2API translates OpenAI tools ↔ Gemini
-# functionDeclarations. Do not point this at Antigravity OAuth / `agy`.
-#
-# Required on the AGY2API host:
-#   AGY_API_KEY     — wrapper auth (Authorization: Bearer)
-#   GEMINI_API_KEY  — Google AI Studio / Gemini API key
+# OMP may send OpenAI `tools`; AGY2API ignores them and runs `agy`
+# with AGY's own tools. Only AGY_API_KEY is required on the host.
 
 providers:
   agy2api:

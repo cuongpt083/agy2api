@@ -40,8 +40,8 @@ Gửi yêu cầu chat hoặc yêu cầu phân tích file/hình ảnh đến mô 
 **Endpoint:** `POST /v1/chat/completions`
 
 - `stream` (optional, default `false`): `true` thì API trả **SSE** (`text/event-stream`) tương thích OpenAI (`data: {chunk}` … `data: [DONE]`).
-- **Không có `tools`:** proxy đọc `agy --output-format stream-json` và chỉ forward `text_delta` của `agent_response`.
-- **Có `tools`:** request đi Gemini API (`GEMINI_API_KEY`), không gọi `agy`. OpenAI `tools` / `tool_calls` / `role: tool` được dịch sang `functionDeclarations` / `functionCall` / `functionResponse`. `finish_reason` là `tool_calls` khi model yêu cầu tool. Cần model `gemini-*`. Thought signature Gemini 3 nằm ở `tool_calls[].extra_content.google.thought_signature` và được cache phía server.
+- Mọi request chat đều gọi `agy`. Proxy đọc `agy --output-format stream-json` và chỉ forward `text_delta` của `agent_response`.
+- Client có thể gửi `tools` (ví dụ Oh-My-Pi). Trường này được chấp nhận nhưng **bỏ qua**; AGY dùng bộ tool của chính nó. Không cần `GEMINI_API_KEY`.
 
 ### Trường hợp 1: Chat Text bình thường
 **Request Body:**

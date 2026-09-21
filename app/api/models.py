@@ -84,7 +84,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[Message]
     temperature: Optional[float] = Field(1.0, description="Sampling temperature")
     stream: Optional[bool] = Field(False, description="Whether to stream back partial progress")
-    tools: Optional[List[ToolSpec]] = Field(None, description="OpenAI function tools. When set, requests go to the Gemini API (not agy).")
+    tools: Optional[List[ToolSpec]] = Field(None, description="Accepted for OpenAI-compatible clients (e.g. Oh-My-Pi) but ignored. AGY uses its own tools.")
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     max_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None

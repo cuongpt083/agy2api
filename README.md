@@ -163,13 +163,9 @@ In **Cursor Settings > Models**:
 
 ## 🧰 Oh-My-Pi / Pi (OpenAI tools)
 
-When `POST /v1/chat/completions` includes `tools`, AGY2API does **not** call `agy`. It translates OpenAI function calling to the official Gemini API (`generateContent`) so Oh-My-Pi (and Pi) can execute tools locally.
+Oh-My-Pi (and Pi) may send OpenAI `tools` on `POST /v1/chat/completions`. AGY2API **accepts** that field so the client does not fail schema validation, but it **does not** forward those tools. The request still goes to `agy`, which uses its own tool surface. No `GEMINI_API_KEY` is required.
 
-1. Set `GEMINI_API_KEY` (Google AI Studio) on the AGY2API host, in addition to `AGY_API_KEY`.
-2. Use a `gemini-*` model id (for example `gemini-3.7-flash-high` or `gemini-2.5-flash`). Claude/GPT slugs on Antigravity are not available on this path.
-3. Point Oh-My-Pi at `http://localhost:8000/v1` with the example config in [`examples/oh-my-pi/models.yml`](examples/oh-my-pi/models.yml).
-
-Thought signatures required by Gemini 3 function calling are returned as `tool_calls[].extra_content.google.thought_signature` and cached server-side if the client strips unknown fields.
+Point Oh-My-Pi at `http://localhost:8000/v1` with the example config in [`examples/oh-my-pi/models.yml`](examples/oh-my-pi/models.yml) and authenticate with `AGY_API_KEY`.
 
 ## 🎨 Developing the UI (Optional)
 

@@ -11,7 +11,6 @@ services:
       - study
     environment:
       - AGY_API_KEY=sk-dummy
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     # Mount local agy binary, gemini config, persistent data, and app code
     volumes:
       - ~/.local/bin/agy:/usr/local/bin/agy:ro

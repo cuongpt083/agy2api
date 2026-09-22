@@ -28,6 +28,7 @@ def build_agy_invocation(
     prompt: str,
     model: str | None,
     output_format: str,
+    extra_dirs: list[str] | None = None,
 ) -> AgyInvocation:
     prompt_dir = tempfile.mkdtemp(prefix="agy2api-prompt-")
     prompt_path = str(Path(prompt_dir) / _PROMPT_FILENAME)
@@ -49,6 +50,8 @@ def build_agy_invocation(
         "--print-timeout",
         "10m",
     ]
+    for extra in extra_dirs or []:
+        cmd.extend(["--add-dir", extra])
     if model:
         cmd.extend(["--model", model])
     return AgyInvocation(cmd=cmd, prompt_dir=prompt_dir, prompt_path=prompt_path)
@@ -90,11 +93,18 @@ async def _drain_stderr(process: asyncio.subprocess.Process) -> bytes:
     return b"".join(chunks)
 
 
-async def run_agy_prompt(prompt: str, model: str = None, output_format: str = "json", files: list[str] = None):
+async def run_agy_prompt(
+    prompt: str,
+    model: str = None,
+    output_format: str = "json",
+    files: list[str] = None,
+    extra_dirs: list[str] | None = None,
+):
     """
     Safely executes the `agy` CLI using asyncio subprocess to avoid blocking.
+    extra_dirs are --add-dir paths owned by the caller; only prompt_dir is deleted.
     """
-    inv = build_agy_invocation(prompt, model, output_format)
+    inv = build_agy_invocation(prompt, model, output_format, extra_dirs=extra_dirs)
     _log_agy_cmd(inv, "command")
     try:
         process = await asyncio.create_subprocess_exec(
@@ -123,9 +133,14 @@ async def run_agy_prompt(prompt: str, model: str = None, output_format: str = "j
         inv.cleanup()
 
 
-async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = None):
+async def stream_agy_prompt(
+    prompt: str,
+    model: str = None,
+    files: list[str] = None,
+    extra_dirs: list[str] | None = None,
+):
     """Yield parsed NDJSON events from `agy --output-format stream-json`."""
-    inv = build_agy_invocation(prompt, model, "stream-json")
+    inv = build_agy_invocation(prompt, model, "stream-json", extra_dirs=extra_dirs)
     _log_agy_cmd(inv, "stream")
     process = None
     stderr_task = None

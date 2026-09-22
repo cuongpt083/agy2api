@@ -86,6 +86,48 @@ class ModelList(BaseModel):
     object: str = "list"
     data: List[Model]
 
+class ImageGenerationRequest(BaseModel):
+    prompt: str = Field(..., description="A text description of the desired image(s).")
+    n: Optional[int] = Field(1, description="Number of images to generate (capped at 4).")
+    response_format: Optional[str] = Field("url", description="Must be one of url or b64_json.")
+    reference_images: Optional[List[str]] = Field(
+        None,
+        description="Optional list of base64 data URIs (max 3) used as reference images.",
+    )
+    model: Optional[str] = Field(None, description="Optional AGY model id, e.g. gemini-3.8-flash-high.")
+    size: Optional[str] = Field(
+        None,
+        description="Target size or aspect ratio, e.g. 1024x1024, 1792x1024, or 9:16.",
+    )
+    stream: Optional[bool] = Field(
+        False,
+        description="If true, return SSE status/image events instead of a single JSON body.",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "prompt": "A cute orange cat playing with a ball of yarn, cartoon style",
+                    "n": 1,
+                    "size": "9:16",
+                    "response_format": "url",
+                }
+            ]
+        }
+    }
+
+
+class ImageObject(BaseModel):
+    url: Optional[str] = None
+    b64_json: Optional[str] = None
+
+
+class ImageGenerationResponse(BaseModel):
+    created: int
+    data: List[ImageObject]
+
+
 class SpeechRequest(BaseModel):
     model: str = Field(..., description="ID của model (vd: 'tts-1', 'tts-1-hd')")
     input: str = Field(..., description="Đoạn văn bản cần chuyển thành giọng nói.")

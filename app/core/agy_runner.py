@@ -33,16 +33,13 @@ def build_agy_invocation(
     prompt_path = str(Path(prompt_dir) / _PROMPT_FILENAME)
     Path(prompt_path).write_text(prompt, encoding="utf-8")
     instruction = (
-        "Read the UTF-8 file at this absolute path and follow its contents as your "
-        "complete instructions. Do not mention the path in your reply:\n"
-        f"{prompt_path}"
+        "Read the UTF-8 file prompt.txt in the current directory and follow its contents as your "
+        "complete instructions. Do not mention the file name in your reply."
     )
     cmd = [
         "agy",
         "--print",
         instruction,
-        "--add-dir",
-        prompt_dir,
         "--output-format",
         output_format,
         "--dangerously-skip-permissions",
@@ -57,11 +54,10 @@ def build_agy_invocation(
 def _log_agy_cmd(inv: AgyInvocation, kind: str) -> None:
     size = os.path.getsize(inv.prompt_path)
     logger.info(
-        "Executing AGY %s: agy --print <file %s (%d bytes)> --add-dir %s --output-format %s",
+        "Executing AGY %s in %s: agy --print <prompt.txt (%d bytes)> --output-format %s",
         kind,
-        inv.prompt_path,
-        size,
         inv.prompt_dir,
+        size,
         inv.cmd[inv.cmd.index("--output-format") + 1] if "--output-format" in inv.cmd else "?",
     )
 
@@ -99,6 +95,7 @@ async def run_agy_prompt(prompt: str, model: str = None, output_format: str = "j
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
+            cwd=inv.prompt_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -132,6 +129,7 @@ async def stream_agy_prompt(prompt: str, model: str = None, files: list[str] = N
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
+            cwd=inv.prompt_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

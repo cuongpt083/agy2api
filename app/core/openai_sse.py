@@ -29,11 +29,23 @@ def usage_from_agy(usage: Optional[dict]) -> dict:
     prompt = int(usage.get("input_tokens") or 0)
     completion = int(usage.get("output_tokens") or 0)
     total = int(usage.get("total_tokens") or (prompt + completion))
-    return {
+    cache_read = int(usage.get("cache_read_tokens") or 0)
+    thinking = int(usage.get("thinking_tokens") or 0)
+
+    res: dict[str, Any] = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
+        "cache_read_tokens": cache_read,
+        "prompt_tokens_details": {
+            "cached_tokens": cache_read,
+        },
     }
+    if thinking:
+        res["completion_tokens_details"] = {
+            "reasoning_tokens": thinking,
+        }
+    return res
 
 
 def openai_chunk(

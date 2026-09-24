@@ -190,9 +190,12 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
     if isinstance(agy_response, dict) and agy_response.get("usage"):
         mapped = usage_from_agy(agy_response.get("usage"))
         usage_data = Usage(
-            prompt_tokens=mapped["prompt_tokens"],
-            completion_tokens=mapped["completion_tokens"],
-            total_tokens=mapped["total_tokens"],
+            prompt_tokens=mapped.get("prompt_tokens", 0),
+            completion_tokens=mapped.get("completion_tokens", 0),
+            total_tokens=mapped.get("total_tokens", 0),
+            cache_read_tokens=mapped.get("cache_read_tokens", 0),
+            prompt_tokens_details=mapped.get("prompt_tokens_details"),
+            completion_tokens_details=mapped.get("completion_tokens_details"),
         )
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",

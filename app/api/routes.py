@@ -1,11 +1,22 @@
+import asyncio
 import time
 import uuid
 import io
-from typing import List, Optional
-from fastapi import APIRouter, Depends, Request, BackgroundTasks, UploadFile, File, Form
+from fastapi import APIRouter, Depends, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, Response, JSONResponse
-from pydantic import BaseModel, Field
-from app.api.models import ChatCompletionRequest, ChatCompletionResponse, Choice, ChoiceMessage, Usage, ModelList, Model, SpeechRequest
+from app.api.models import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    Choice,
+    ChoiceMessage,
+    Usage,
+    ModelList,
+    Model,
+    SpeechRequest,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
+    ImageObject,
+)
 from app.core.security import get_api_key
 from app.core.agy_runner import run_agy_prompt, stream_agy_prompt
 from app.core.openai_sse import (
@@ -20,37 +31,22 @@ import re
 from app.core.file_handler import TempFileManager
 from app.core.capcut_api import AsyncCapCutWrapper
 from app.core.model_manager import get_available_models
+from app.core.image_generation import (
+    MAX_REFERENCE_IMAGES,
+    ImageWorkspace,
+    agy_text_from_response,
+    build_image_prompt,
+    clamp_n,
+    collect_generated_images,
+    encode_image_objects,
+    snapshot_image_sizes,
+    stable_output_images,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 capcut_wrapper = AsyncCapCutWrapper()
-
-class ImageGenerationRequest(BaseModel):
-    prompt: str = Field(..., description="A text description of the desired image(s). (Tips: You can include desired aspect ratios here like 9:16 or 16:9)")
-    n: Optional[int] = Field(1, description="The number of images to generate")
-    response_format: Optional[str] = Field("url", description="The format in which the generated images are returned. Must be one of url or b64_json")
-    reference_images: Optional[List[str]] = Field(None, description="Optional list of base64 data URIs to use as reference images.")
-
-    model_config = {
-        "json_schema_extra": {
-            "examples": [
-                {
-                    "prompt": "A cute orange cat playing with a ball of yarn, cartoon style, tỉ lệ 9:16",
-                    "n": 1,
-                    "response_format": "url"
-                }
-            ]
-        }
-    }
-
-class ImageObject(BaseModel):
-    url: Optional[str] = None
-    b64_json: Optional[str] = None
-
-class ImageGenerationResponse(BaseModel):
-    created: int
-    data: List[ImageObject]
 
 @router.get("/models", response_model=ModelList, summary="List Models", description="Returns a list of available AI models.")
 async def list_models(api_key: str = Depends(get_api_key)):
@@ -205,65 +201,143 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
         usage=usage_data,
     )
 
-@router.post("/images/generations", response_model=ImageGenerationResponse, summary="Image Generations", description="Creates an image given a prompt using the AGY artist skills.")
-async def generate_image(req: ImageGenerationRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
-    logger.info(f"Generating image. Prompt: {req.prompt[:50]}...")
-    file_mgr = TempFileManager()
-    background_tasks.add_task(file_mgr.cleanup)
-    
-    ref_paths = []
-    if req.reference_images:
-        for url in req.reference_images:
-            if url.startswith("data:"):
-                ext = ".png"
-                if "jpeg" in url or "jpg" in url: ext = ".jpg"
-                try:
-                    fpath = file_mgr.add_base64_file(url, ext=ext)
-                    ref_paths.append(fpath)
-                except Exception:
-                    pass
+def _prepare_image_job(req: ImageGenerationRequest) -> tuple[ImageWorkspace, str, int]:
+    n = clamp_n(req.n)
+    workspace = ImageWorkspace()
+    ref_paths: list[str] = []
+    for i, url in enumerate((req.reference_images or [])[:MAX_REFERENCE_IMAGES]):
+        if not url:
+            continue
+        try:
+            ref_paths.append(workspace.add_reference(url, i))
+        except Exception as e:
+            logger.warning("Skipping invalid reference image %s: %s", i, e)
+    prompt = build_image_prompt(
+        prompt=req.prompt,
+        out_dir=workspace.out_dir,
+        n=n,
+        size=req.size,
+        ref_paths=ref_paths,
+    )
+    return workspace, prompt, n
 
-    # We instruct AGY to generate an image and return the path/base64 in JSON format
-    prompt = f"Generate an image for the following prompt: '{req.prompt}'. Return ONLY the absolute local file path of the generated image in your response, do not include any other conversational text."
-    
-    if ref_paths:
-        paths_str = ", ".join([f"'{p}'" for p in ref_paths])
-        prompt = f"Use the reference images at {paths_str} to generate an image for the following prompt: '{req.prompt}'. Return ONLY the absolute local file path of the generated image in your response, do not include any other conversational text."
-    
-    agy_response = await run_agy_prompt(prompt=prompt, output_format="json")
-    
-    # Extract path
-    image_path = ""
-    if isinstance(agy_response, dict):
-        image_path = agy_response.get("text") or agy_response.get("content") or agy_response.get("response") or str(agy_response)
-    else:
-        image_path = str(agy_response)
-        
-    image_path = image_path.strip()
-    img_data = ImageObject(url=image_path)
-    
-    import os
-    if os.path.exists(image_path) and os.path.isfile(image_path):
-        import base64
-        with open(image_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-            if req.response_format == "b64_json":
-                img_data = ImageObject(b64_json=b64)
-            else:
-                img_data = ImageObject(url=f"data:image/png;base64,{b64}")
-                
-        # Schedule cleanup of the generated image file after returning the response
-        def remove_file(path):
+
+def _image_error_payload(message: str) -> dict:
+    return {
+        "type": "error",
+        "error": {"message": message, "type": "image_generation_error"},
+    }
+
+
+async def _sse_image_generation(
+    req: ImageGenerationRequest,
+    workspace: ImageWorkspace,
+    prompt: str,
+    n: int,
+):
+    yield format_sse({"type": "status", "stage": "started"})
+    yield format_sse({"type": "status", "stage": "generating"})
+    prev_sizes: dict[str, int] = {}
+    last_text = ""
+    emitted = False
+    agen = stream_agy_prompt(prompt=prompt, model=req.model, extra_dirs=[workspace.root])
+    try:
+        while True:
+            event = None
             try:
-                os.remove(path)
-            except Exception:
+                event = await asyncio.wait_for(agen.__anext__(), timeout=0.2)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
                 pass
-        
-        background_tasks.add_task(remove_file, image_path)
+            if isinstance(event, dict):
+                result = event.get("result")
+                if isinstance(result, dict):
+                    last_text = agy_text_from_response(result) or last_text
+            ready = stable_output_images(workspace.out_dir, n, prev_sizes)
+            prev_sizes = snapshot_image_sizes(workspace.out_dir)
+            if ready:
+                encoded = encode_image_objects(ready, req.response_format or "url")
+                yield format_sse(
+                    {"type": "image", "created": int(time.time()), "data": encoded}
+                )
+                emitted = True
+                break
+        if not emitted:
+            paths = collect_generated_images(workspace.out_dir, last_text, n)
+            if not paths:
+                yield format_sse(_image_error_payload("AGY did not produce an image file."))
+            else:
+                encoded = encode_image_objects(paths, req.response_format or "url")
+                yield format_sse(
+                    {"type": "image", "created": int(time.time()), "data": encoded}
+                )
+        yield format_sse({"type": "done"})
+        yield format_sse("[DONE]")
+    except Exception as e:
+        logger.error("AGY image stream failed: %s", e, exc_info=True)
+        yield format_sse(_image_error_payload(str(e)))
+        yield format_sse({"type": "done"})
+        yield format_sse("[DONE]")
+    finally:
+        try:
+            await agen.aclose()
+        except Exception:
+            pass
+        workspace.cleanup()
 
+
+@router.post("/images/generations", response_model=ImageGenerationResponse, summary="Image Generations", description="Creates an image given a prompt using AGY. Returns image bytes as a data URI or b64_json. Set stream=true for SSE status/image events.")
+async def generate_image(req: ImageGenerationRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
+    logger.info("Generating image. Prompt: %s... stream=%s", req.prompt[:50], req.stream)
+    workspace, prompt, n = _prepare_image_job(req)
+
+    if req.stream:
+        return StreamingResponse(
+            _sse_image_generation(req, workspace, prompt, n),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    background_tasks.add_task(workspace.cleanup)
+    try:
+        agy_response = await run_agy_prompt(
+            prompt=prompt,
+            model=req.model,
+            output_format="json",
+            extra_dirs=[workspace.root],
+        )
+    except Exception as e:
+        logger.error("AGY image generation failed: %s", e, exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": str(e), "type": "image_generation_error"}},
+        )
+
+    paths = collect_generated_images(
+        workspace.out_dir,
+        agy_text_from_response(agy_response),
+        n,
+    )
+    if not paths:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "message": "AGY did not produce an image file.",
+                    "type": "image_generation_error",
+                }
+            },
+        )
+
+    encoded = encode_image_objects(paths, req.response_format or "url")
     return ImageGenerationResponse(
         created=int(time.time()),
-        data=[img_data]
+        data=[ImageObject(**item) for item in encoded],
     )
 
 import subprocess

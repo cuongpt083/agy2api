@@ -132,15 +132,27 @@ data: [DONE]
 ---
 
 ## 3. Image Generations
-Tạo hình ảnh AI dựa trên prompt văn bản (Text-to-Image) hoặc tạo ảnh dựa trên 1-3 ảnh tham chiếu (Image-to-Image / Image Variations). Hệ thống sẽ chạy lệnh gọi tính năng Artist của AGY ở background.
+Tạo hình ảnh AI dựa trên prompt văn bản (Text-to-Image) hoặc tạo ảnh dựa trên 1-3 ảnh tham chiếu (Image-to-Image). Mỗi request có workspace riêng (`refs/` + `out/`); AGY ghi file vào `out/`, API encode bytes rồi mới xóa workspace. Không bao giờ trả path local.
 
 **Endpoint:** `POST /v1/images/generations`
+
+| Field | Required | Description |
+|---|---|---|
+| `prompt` | Yes | Mô tả ảnh cần tạo |
+| `n` | No | Số ảnh (mặc định 1, tối đa 4) |
+| `size` | No | Kích thước hoặc tỉ lệ, vd `1024x1024`, `1792x1024`, `9:16` (nhúng vào instruction cho AGY) |
+| `model` | No | Model AGY (vd `gemini-3.8-flash-high`). Bỏ trống = model mặc định của CLI |
+| `response_format` | No | `url` (data URI, mặc định) hoặc `b64_json` (base64 thuần) |
+| `reference_images` | No | Tối đa 3 data URI base64 dùng làm ảnh tham chiếu |
+| `stream` | No | `true` thì trả SSE (`text/event-stream`): `status` ngay khi nhận request, `image` ngay khi file ổn định trong `out/` (không chờ agent kết thúc), rồi `done` |
 
 **Request Body Example (Text-to-Image):**
 ```json
 {
   "prompt": "A cute orange cat playing with a ball of yarn, cartoon style",
   "n": 1,
+  "size": "9:16",
+  "model": "gemini-3.8-flash-high",
   "response_format": "url"
 }
 ```
@@ -156,7 +168,6 @@ Tạo hình ảnh AI dựa trên prompt văn bản (Text-to-Image) hoặc tạo 
   ]
 }
 ```
-*(Ghi chú: Nếu bạn để `response_format` là `b64_json`, API sẽ trả về dữ liệu hình ảnh dạng Base64 thuần túy. Nếu để `url`, API sẽ tự bọc nó dưới dạng Data URI `data:image/png;base64,...` để tương thích frontend. Tham số `reference_images` là tùy chọn, hỗ trợ gửi tối đa 3 ảnh dưới dạng mảng các chuỗi Base64 Data URI).*
 
 **Response Example:**
 ```json
@@ -168,6 +179,33 @@ Tạo hình ảnh AI dựa trên prompt văn bản (Text-to-Image) hoặc tạo 
       "b64_json": null
     }
   ]
+}
+```
+
+**Streaming (`stream: true`):** `Content-Type: text/event-stream`
+
+```
+data: {"type":"status","stage":"started"}
+
+data: {"type":"status","stage":"generating"}
+
+data: {"type":"image","created":1786102966,"data":[{"url":"data:image/png;base64,...","b64_json":null}]}
+
+data: {"type":"done"}
+
+data: [DONE]
+```
+
+Lỗi không có file ảnh: không-stream trả **502**; stream trả frame `type=error` rồi `done`.
+
+Không-stream **502**:
+
+```json
+{
+  "error": {
+    "message": "AGY did not produce an image file.",
+    "type": "image_generation_error"
+  }
 }
 ```
 

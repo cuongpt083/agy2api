@@ -4,11 +4,16 @@ import shutil
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from app.api.routes import router as api_router
 from app.core.model_manager import get_available_models
+from app.core.metrics import (
+    IN_FLIGHT_REQUESTS,
+    expose_metrics,
+    record_http_request,
+)
 
 import uuid
 import logging
@@ -57,28 +62,50 @@ app.include_router(api_router, prefix="/v1")
 async def trace_log_middleware(request: Request, call_next):
     trace_id = uuid.uuid4().hex[:8]
     trace_id_var.set(trace_id)
-    
+    endpoint = request.url.path
+    if IN_FLIGHT_REQUESTS is not None:
+        try:
+            IN_FLIGHT_REQUESTS.labels(endpoint=endpoint).inc()
+        except Exception:
+            pass
+
     logger.info(f"Incoming request: {request.method} {request.url.path}")
     start_time = time.time()
-    
+    status_code = 500
+
     try:
         response = await call_next(request)
+        status_code = response.status_code
         process_time = time.time() - start_time
         logger.info(f"Completed request: {response.status_code} in {process_time:.3f}s")
         response.headers["X-Trace-ID"] = trace_id
+        record_http_request(request.method, endpoint, status_code, process_time)
         return response
     except Exception as e:
         process_time = time.time() - start_time
         logger.error(f"Request failed: {str(e)} in {process_time:.3f}s", exc_info=True)
+        record_http_request(request.method, endpoint, status_code, process_time)
         raise
+    finally:
+        if IN_FLIGHT_REQUESTS is not None:
+            try:
+                IN_FLIGHT_REQUESTS.labels(endpoint=endpoint).dec()
+            except Exception:
+                pass
 
 @app.get("/health")
 async def health_check():
     return JSONResponse(content={"status": "ok", "message": "AGY wrapper is running"})
 
+@app.get("/metrics")
+async def prometheus_metrics():
+    body, content_type = expose_metrics()
+    return Response(content=body, media_type=content_type)
+
 # Serve UI if dist folder exists
 ui_dist = os.path.join(os.path.dirname(__file__), "..", "ui", "dist")
 if os.path.exists(ui_dist):
     app.mount("/", StaticFiles(directory=ui_dist, html=True), name="static")
+
 
 

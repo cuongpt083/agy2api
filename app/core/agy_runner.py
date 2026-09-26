@@ -4,8 +4,11 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from app.core.metrics import record_runner_execution
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +107,7 @@ async def run_agy_prompt(
     """
     inv = build_agy_invocation(prompt, model, output_format, extra_dirs=extra_dirs)
     _log_agy_cmd(inv, "command")
+    t0 = time.time()
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
@@ -119,15 +123,20 @@ async def run_agy_prompt(
             if not error_msg:
                 error_msg = stdout.decode().strip()
             logger.error(f"AGY Error: {error_msg}")
+            record_runner_execution(model or "default", output_format, "error", time.time() - t0)
             raise RuntimeError(f"AGY CLI execution failed: {error_msg}")
 
         output_str = stdout.decode().strip()
+        record_runner_execution(model or "default", output_format, "success", time.time() - t0)
 
         try:
             return _parse_json_envelope(output_str)
         except json.JSONDecodeError:
             logger.error(f"Failed to parse AGY JSON output: {output_str}")
             return {"text": output_str}
+    except Exception:
+        record_runner_execution(model or "default", output_format, "error", time.time() - t0)
+        raise
     finally:
         inv.cleanup()
 
@@ -143,6 +152,7 @@ async def stream_agy_prompt(
     _log_agy_cmd(inv, "stream")
     process = None
     stderr_task = None
+    t0 = time.time()
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
@@ -169,7 +179,12 @@ async def stream_agy_prompt(
         if process.returncode != 0:
             error_msg = stderr.decode().strip()
             logger.error(f"AGY Error: {error_msg}")
+            record_runner_execution(model or "default", "stream-json", "error", time.time() - t0)
             raise RuntimeError(f"AGY CLI execution failed: {error_msg}")
+        record_runner_execution(model or "default", "stream-json", "success", time.time() - t0)
+    except Exception:
+        record_runner_execution(model or "default", "stream-json", "error", time.time() - t0)
+        raise
     finally:
         if process is not None and process.returncode is None:
             process.kill()

@@ -42,6 +42,12 @@ from app.core.image_generation import (
     snapshot_image_sizes,
     stable_output_images,
 )
+from app.core.metrics import (
+    record_chat_completion,
+    record_image_generation,
+    record_speech_request,
+    record_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,10 +121,15 @@ def _assistant_text(agy_response) -> str:
 async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, file_mgr: TempFileManager):
     sent = ""
     role_sent = False
+    t0 = time.time()
+    first_token_time = None
     try:
         async for event in stream_agy_prompt(prompt=prompt, model=model):
             piece, sent = extract_agent_text_delta(event, sent)
             if piece:
+                now = time.time()
+                if first_token_time is None:
+                    first_token_time = now - t0
                 delta = {"content": piece}
                 if not role_sent:
                     delta["role"] = "assistant"
@@ -135,6 +146,14 @@ async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, 
                     delta["role"] = "assistant"
                     role_sent = True
                 yield format_sse(openai_chunk(chat_id, created, model, delta))
+            usage_dict = usage_from_agy(result.get("usage"))
+            record_tokens(
+                model,
+                usage_dict.get("prompt_tokens"),
+                usage_dict.get("completion_tokens"),
+                usage_dict.get("total_tokens"),
+                usage_dict.get("cache_read_tokens"),
+            )
             yield format_sse(
                 openai_chunk(
                     chat_id,
@@ -142,11 +161,27 @@ async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, 
                     model,
                     {},
                     finish_reason="stop",
-                    usage=usage_from_agy(result.get("usage")),
+                    usage=usage_dict,
                 )
             )
+        duration = time.time() - t0
+        record_chat_completion(
+            model,
+            stream=True,
+            status="success",
+            duration=duration,
+            first_token_duration=first_token_time,
+        )
         yield format_sse("[DONE]")
     except Exception as e:
+        duration = time.time() - t0
+        record_chat_completion(
+            model,
+            stream=True,
+            status="error",
+            duration=duration,
+            first_token_duration=first_token_time,
+        )
         logger.error("AGY stream failed: %s", e, exc_info=True)
         err = {
             "error": {
@@ -180,26 +215,40 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
         )
 
     background_tasks.add_task(file_mgr.cleanup)
-    agy_response = await run_agy_prompt(prompt=final_prompt, model=req.model, files=files_to_attach)
-    assistant_text = _assistant_text(agy_response)
-    usage_data = Usage()
-    if isinstance(agy_response, dict) and agy_response.get("usage"):
-        mapped = usage_from_agy(agy_response.get("usage"))
-        usage_data = Usage(
-            prompt_tokens=mapped.get("prompt_tokens", 0),
-            completion_tokens=mapped.get("completion_tokens", 0),
-            total_tokens=mapped.get("total_tokens", 0),
-            cache_read_tokens=mapped.get("cache_read_tokens", 0),
-            prompt_tokens_details=mapped.get("prompt_tokens_details"),
-            completion_tokens_details=mapped.get("completion_tokens_details"),
+    t0 = time.time()
+    try:
+        agy_response = await run_agy_prompt(prompt=final_prompt, model=req.model, files=files_to_attach)
+        duration = time.time() - t0
+        assistant_text = _assistant_text(agy_response)
+        usage_data = Usage()
+        if isinstance(agy_response, dict) and agy_response.get("usage"):
+            mapped = usage_from_agy(agy_response.get("usage"))
+            usage_data = Usage(
+                prompt_tokens=mapped.get("prompt_tokens", 0),
+                completion_tokens=mapped.get("completion_tokens", 0),
+                total_tokens=mapped.get("total_tokens", 0),
+                cache_read_tokens=mapped.get("cache_read_tokens", 0),
+                prompt_tokens_details=mapped.get("prompt_tokens_details"),
+                completion_tokens_details=mapped.get("completion_tokens_details"),
+            )
+            record_tokens(
+                req.model,
+                usage_data.prompt_tokens,
+                usage_data.completion_tokens,
+                usage_data.total_tokens,
+                usage_data.cache_read_tokens,
+            )
+        record_chat_completion(req.model, stream=False, status="success", duration=duration)
+        return ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            created=int(time.time()),
+            model=req.model,
+            choices=[Choice(message=ChoiceMessage(content=assistant_text))],
+            usage=usage_data,
         )
-    return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
-        created=int(time.time()),
-        model=req.model,
-        choices=[Choice(message=ChoiceMessage(content=assistant_text))],
-        usage=usage_data,
-    )
+    except Exception as exc:
+        record_chat_completion(req.model, stream=False, status="error", duration=time.time() - t0)
+        raise
 
 def _prepare_image_job(req: ImageGenerationRequest) -> tuple[ImageWorkspace, str, int]:
     n = clamp_n(req.n)
@@ -272,9 +321,11 @@ async def _sse_image_generation(
                 yield format_sse(
                     {"type": "image", "created": int(time.time()), "data": encoded}
                 )
+        record_image_generation("success")
         yield format_sse({"type": "done"})
         yield format_sse("[DONE]")
     except Exception as e:
+        record_image_generation("error")
         logger.error("AGY image stream failed: %s", e, exc_info=True)
         yield format_sse(_image_error_payload(str(e)))
         yield format_sse({"type": "done"})
@@ -312,6 +363,7 @@ async def generate_image(req: ImageGenerationRequest, background_tasks: Backgrou
             extra_dirs=[workspace.root],
         )
     except Exception as e:
+        record_image_generation("error")
         logger.error("AGY image generation failed: %s", e, exc_info=True)
         return JSONResponse(
             status_code=502,
@@ -324,6 +376,7 @@ async def generate_image(req: ImageGenerationRequest, background_tasks: Backgrou
         n,
     )
     if not paths:
+        record_image_generation("error")
         return JSONResponse(
             status_code=502,
             content={
@@ -334,6 +387,7 @@ async def generate_image(req: ImageGenerationRequest, background_tasks: Backgrou
             },
         )
 
+    record_image_generation("success")
     encoded = encode_image_objects(paths, req.response_format or "url")
     return ImageGenerationResponse(
         created=int(time.time()),
@@ -377,8 +431,10 @@ async def audio_speech(req: SpeechRequest, api_key: str = Depends(get_api_key)):
             voice=req.voice,
             speed=req.speed
         )
+        record_speech_request("success")
         return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
     except Exception as e:
+        record_speech_request("error")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @router.get(

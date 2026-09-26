@@ -87,8 +87,11 @@ def build_chat_prompt(req: ChatCompletionRequest, file_mgr: TempFileManager) -> 
     files_to_attach = []
 
     for msg in req.messages:
+        role_name = msg.role.capitalize()
+        content_text = ""
+
         if isinstance(msg.content, str):
-            prompt_lines.append(f"{msg.role.capitalize()}: {msg.content}")
+            content_text = msg.content
         elif isinstance(msg.content, list):
             text_parts = []
             for p in msg.content:
@@ -106,7 +109,28 @@ def build_chat_prompt(req: ChatCompletionRequest, file_mgr: TempFileManager) -> 
                             text_parts.append(f"[Failed to attach image: {e}]")
                     else:
                         text_parts.append(f"[Image URL: {url}]")
-            prompt_lines.append(f"{msg.role.capitalize()}: {' '.join(text_parts)}")
+            content_text = " ".join(text_parts)
+
+        # 1. Assistant message with tool calls
+        if msg.role == "assistant" and getattr(msg, "tool_calls", None):
+            call_strs = []
+            for tc in msg.tool_calls:
+                fn = tc.get("function") or {}
+                fn_name = fn.get("name", "tool")
+                fn_args = fn.get("arguments", "")
+                call_strs.append(f"{fn_name}({fn_args})")
+            call_repr = f"[Tool Call: {'; '.join(call_strs)}]"
+            if content_text:
+                prompt_lines.append(f"Assistant: {content_text}\n{call_repr}")
+            else:
+                prompt_lines.append(f"Assistant: {call_repr}")
+        # 2. Tool output message
+        elif msg.role == "tool":
+            tool_label = getattr(msg, "name", None) or getattr(msg, "tool_call_id", None) or "output"
+            prompt_lines.append(f"Tool Result ({tool_label}): {content_text}")
+        # 3. Standard messages (user, system, assistant plain text)
+        elif content_text:
+            prompt_lines.append(f"{role_name}: {content_text}")
 
     prompt_lines.append("Assistant: ")
     return "\n".join(prompt_lines), files_to_attach

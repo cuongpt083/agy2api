@@ -1,5 +1,5 @@
 import asyncio
-import json
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,28 +16,31 @@ class TestProcessPool(unittest.TestCase):
             mock_proc.terminate = MagicMock()
             mock_proc.wait = AsyncMock(return_value=0)
 
+            default_m = pool.warm_models[0]
             worker = WarmWorker(
                 process=mock_proc,
                 prompt_dir="/tmp/test-worker",
-                model=None,
-                created_at=100.0,
+                model=default_m,
+                created_at=time.time(),
                 init_event={"event": "init"},
             )
 
             # Manually seed one worker
             pool._running = True
-            await pool._pool.put(worker)
+            if default_m not in pool._pools:
+                pool._pools[default_m] = asyncio.Queue()
+            await pool._pools[default_m].put(worker)
 
             # Acquire worker
             with patch.object(pool, "_spawn_worker_safe", new_callable=AsyncMock) as mock_replenish:
-                acquired = await pool.acquire(model=None)
+                acquired = await pool.acquire(model=default_m)
                 self.assertIsNotNone(acquired)
                 self.assertEqual(acquired.process.pid, 12345)
                 # Verify replenishment triggered immediately
                 mock_replenish.assert_called_once()
 
             # Second acquire should return None (pool empty)
-            second = await pool.acquire(model=None)
+            second = await pool.acquire(model=default_m)
             self.assertIsNone(second)
 
             await worker.close()
@@ -53,19 +56,22 @@ class TestProcessPool(unittest.TestCase):
             mock_proc.returncode = 1  # Process died
             mock_proc.pid = 99999
 
+            default_m = pool.warm_models[0]
             worker = WarmWorker(
                 process=mock_proc,
                 prompt_dir="/tmp/test-dead-worker",
-                model=None,
+                model=default_m,
                 created_at=100.0,
                 init_event={"event": "init"},
             )
 
             pool._running = True
-            await pool._pool.put(worker)
+            if default_m not in pool._pools:
+                pool._pools[default_m] = asyncio.Queue()
+            await pool._pools[default_m].put(worker)
 
             with patch.object(pool, "_spawn_worker_safe", new_callable=AsyncMock) as mock_replenish:
-                acquired = await pool.acquire(model=None)
+                acquired = await pool.acquire(model=default_m)
                 # Dead process must be discarded and return None
                 self.assertIsNone(acquired)
                 mock_replenish.assert_called_once()

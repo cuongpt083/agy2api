@@ -195,16 +195,6 @@ class AgyProcessPool:
             await worker.close()
         self._active_workers.clear()
         self._pools.clear()
-        logger.info("Shutting down AgyProcessPool...")
-        while not self._pool.empty():
-            try:
-                worker = self._pool.get_nowait()
-                await worker.close()
-            except Exception:
-                pass
-        for worker in list(self._active_workers):
-            await worker.close()
-        self._active_workers.clear()
 
 
 # Global pool singleton

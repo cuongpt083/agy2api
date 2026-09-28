@@ -75,6 +75,7 @@ flowchart LR
 | **Operations** | Integrated web UI for managing API keys and viewing logs, Daemon Mode (Docker & Systemd) |
 | **Tool Calling** | Emulates OpenAI function calling (`tools`, `tool_choice`, `tool_calls`, `role: tool`) via `agy --json-schema` |
 | **Metrics** | Built-in Prometheus metrics export via `/metrics` (`prometheus-client>=0.20.0`) |
+| **Performance** | Warm spare process pool (`AGY_POOL_SIZE`, `AGY_POOL_MODELS`, `AGY_POOL_MAX_DYNAMIC_MODELS`) with dynamic auto-warm and LRU eviction |
 
 ## 🚀 Quick Start
 
@@ -143,6 +144,16 @@ For a robust background service on Linux, you can use `systemd`. We have provide
 ## 🛡️ Safety Hooks
 
 To enable the safety gate in your local `agy` environment, link or copy `hooks.json` to your `~/.gemini/config/hooks.json` or `.agents/hooks.json`.
+
+## ⚡ Configuration & Process Pool
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `AGY_API_KEY` | *(required)* | Secret API key for authenticating incoming requests |
+| `AGY_POOL_SIZE` | `1` | Number of warm standby worker processes per model. Set to `0` to disable pool |
+| `AGY_DEFAULT_MODEL` | `gemini-3.8-flash-high` | Default model pre-warmed at startup if `AGY_POOL_MODELS` is not set |
+| `AGY_POOL_MODELS` | `gemini-3.8-flash-high` | Comma-separated list of models to pre-warm on server startup |
+| `AGY_POOL_MAX_DYNAMIC_MODELS` | `3` | Maximum number of model pools kept warm simultaneously before LRU eviction |
 
 ## 🔌 API Endpoints
 - `GET /health`

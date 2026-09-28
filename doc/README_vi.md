@@ -75,6 +75,7 @@ flowchart LR
 | **Vận hành** | Có sẵn giao diện Web UI để quản lý API keys, xem logs, hỗ trợ chạy nền qua Docker hoặc Systemd |
 | **Gọi công cụ (Tool Calling)** | Giả lập OpenAI function/tool calling (`tools`, `tool_choice`, `tool_calls`, `role: tool`) thông qua `agy --json-schema` |
 | **Giám sát (Metrics)** | Tích hợp sẵn xuất số liệu Prometheus qua `/metrics` (`prometheus-client>=0.20.0`) |
+| **Hiệu năng (Performance)** | Cơ chế warm process pool (`AGY_POOL_SIZE`, `AGY_POOL_MODELS`, `AGY_POOL_MAX_DYNAMIC_MODELS`) tự động pre-warm và giải phóng LRU |
 
 ## 🚀 Hướng dẫn Nhanh
 
@@ -143,6 +144,16 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## 🛡️ Hook An toàn (Safety Hooks)
 
 Để bật chế độ bảo vệ (safety gate) cho môi trường `agy` ở local, bạn hãy link hoặc copy file `hooks.json` vào `~/.gemini/config/hooks.json` hoặc `.agents/hooks.json`.
+
+## ⚡ Cấu hình Môi trường & Process Pool
+
+| Biến môi trường | Mặc định | Mô tả |
+| :--- | :--- | :--- |
+| `AGY_API_KEY` | *(bắt buộc)* | Khóa bí mật dùng để xác thực các yêu cầu API |
+| `AGY_POOL_SIZE` | `1` | Số lượng worker tiến trình warm dự phòng cho mỗi model. Đặt `0` để tắt pool |
+| `AGY_DEFAULT_MODEL` | `gemini-3.8-flash-high` | Model mặc định được khởi tạo sẵn khi khởi động nếu không đặt `AGY_POOL_MODELS` |
+| `AGY_POOL_MODELS` | `gemini-3.8-flash-high` | Danh sách model phân tách bằng dấu phẩy cần pre-warm khi server khởi động |
+| `AGY_POOL_MAX_DYNAMIC_MODELS` | `3` | Số lượng tối đa model pool được giữ đồng thời trong bộ nhớ trước khi thu hồi theo LRU |
 
 ## 🔌 Các Endpoint Chính
 - `GET /health`

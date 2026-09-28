@@ -2,7 +2,7 @@ import asyncio
 import time
 import uuid
 import io
-from fastapi import APIRouter, Depends, BackgroundTasks, UploadFile, File, Form
+from fastapi import APIRouter, Depends, BackgroundTasks, UploadFile, File, Form, Header
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from app.api.models import (
     ChatCompletionRequest,
@@ -57,6 +57,7 @@ from app.core.metrics import (
     record_speech_request,
     record_tokens,
 )
+from app.core.capture import global_capture_manager
 
 logger = logging.getLogger(__name__)
 
@@ -162,12 +163,16 @@ async def _sse_chat_stream(
     created: int,
     file_mgr: TempFileManager,
     emulate_tools: bool = False,
+    req_payload: dict = None,
+    source_agent: str = None,
 ):
     sent = ""
     role_sent = False
     events: list[dict] = []
     t0 = time.time()
     first_token_time = None
+    captured_frames: list[bytes] = []
+    conv_id = None
     try:
         agen = stream_agy_prompt(
             prompt=prompt,
@@ -176,6 +181,15 @@ async def _sse_chat_stream(
             stop_after_first_schema_object=emulate_tools,
         )
         async for event in agen:
+            if event.get("event") == "init":
+                conv_id = event.get("conversation_id") or (
+                    (event.get("init") or {}).get("conversation_id")
+                )
+            elif event.get("event") == "result":
+                res = event.get("result") or {}
+                if res.get("conversation_id"):
+                    conv_id = res.get("conversation_id")
+
             if emulate_tools:
                 events.append(event)
                 continue
@@ -188,7 +202,9 @@ async def _sse_chat_stream(
                 if not role_sent:
                     delta["role"] = "assistant"
                     role_sent = True
-                yield format_sse(openai_chunk(chat_id, created, model, delta))
+                frame = format_sse(openai_chunk(chat_id, created, model, delta))
+                captured_frames.append(frame)
+                yield frame
             if event.get("event") != "result":
                 continue
             result = event.get("result") or {}
@@ -199,7 +215,9 @@ async def _sse_chat_stream(
                 if not role_sent:
                     delta["role"] = "assistant"
                     role_sent = True
-                yield format_sse(openai_chunk(chat_id, created, model, delta))
+                frame = format_sse(openai_chunk(chat_id, created, model, delta))
+                captured_frames.append(frame)
+                yield frame
             usage_dict = usage_from_agy(result.get("usage"))
             record_tokens(
                 model,
@@ -208,7 +226,7 @@ async def _sse_chat_stream(
                 usage_dict.get("total_tokens"),
                 usage_dict.get("cache_read_tokens"),
             )
-            yield format_sse(
+            stop_frame = format_sse(
                 openai_chunk(
                     chat_id,
                     created,
@@ -218,6 +236,8 @@ async def _sse_chat_stream(
                     usage=usage_dict,
                 )
             )
+            captured_frames.append(stop_frame)
+            yield stop_frame
         duration = time.time() - t0
         record_chat_completion(
             model,
@@ -238,6 +258,7 @@ async def _sse_chat_stream(
                     u.get("cache_read_tokens"),
                 )
             for frame in events_to_sse_bytes_with_tools(events, chat_id, created, model):
+                captured_frames.append(frame)
                 yield frame
         else:
             yield format_sse("[DONE]")
@@ -261,22 +282,47 @@ async def _sse_chat_stream(
         yield format_sse("[DONE]")
     finally:
         file_mgr.cleanup()
+        if req_payload and captured_frames:
+            try:
+                global_capture_manager.enqueue_turn(
+                    request_payload=req_payload,
+                    response_data=captured_frames,
+                    source_agent=source_agent,
+                    latency_ms=int((time.time() - t0) * 1000),
+                    stream=True,
+                    conversation_id=conv_id,
+                )
+            except Exception as capture_err:
+                logger.warning("Failed to enqueue streaming capture: %s", capture_err)
 
 
 @router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE. Pass OpenAI `tools` to emulate function calling via agy --json-schema.")
-async def chat_completions(req: ChatCompletionRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
+async def chat_completions(
+    req: ChatCompletionRequest,
+    background_tasks: BackgroundTasks,
+    api_key: str = Depends(get_api_key),
+    x_source_agent: Optional[str] = Header(default=None, alias="X-Source-Agent"),
+):
     logger.info(f"Processing chat completions for model: {req.model} stream={req.stream} tools={bool(req.tools)}")
     file_mgr = TempFileManager()
     final_prompt, files_to_attach = build_chat_prompt(req, file_mgr)
     emulate_tools = bool(req.tools) and req.tool_choice != "none"
     schema = TOOLS_JSON_SCHEMA if emulate_tools else None
+    req_dict = req.model_dump()
 
     if req.stream:
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         return StreamingResponse(
             _sse_chat_stream(
-                final_prompt, req.model, chat_id, created, file_mgr, emulate_tools=emulate_tools
+                final_prompt,
+                req.model,
+                chat_id,
+                created,
+                file_mgr,
+                emulate_tools=emulate_tools,
+                req_payload=req_dict,
+                source_agent=x_source_agent,
             ),
             media_type="text/event-stream",
             headers={
@@ -316,12 +362,13 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
             )
         record_chat_completion(req.model, stream=False, status="success", duration=duration)
 
+        non_stream_conv_id = agy_response.get("conversation_id") if isinstance(agy_response, dict) else None
         if emulate_tools and isinstance(agy_response, dict):
             raw = agy_response.get("response") or agy_response.get("text") or agy_response.get("content") or ""
             parsed = parse_emulated_output(str(raw), agy_response.get("structured_output"))
             if parsed.get("kind") == "tool_call":
                 tcs = [ToolCall(**tc) for tc in to_openai_tool_calls(parsed)]
-                return ChatCompletionResponse(
+                resp = ChatCompletionResponse(
                     id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                     created=int(time.time()),
                     model=req.model,
@@ -333,17 +380,38 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
                     ],
                     usage=usage_data,
                 )
+                global_capture_manager.enqueue_turn(
+                    request_payload=req_dict,
+                    response_data=resp.model_dump(),
+                    source_agent=x_source_agent,
+                    latency_ms=int(duration * 1000),
+                    stream=False,
+                    conversation_id=non_stream_conv_id,
+                )
+                return resp
             assistant_text = parsed.get("content") or ""
         else:
             assistant_text = _assistant_text(agy_response)
 
-        return ChatCompletionResponse(
+        resp = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
             created=int(time.time()),
             model=req.model,
             choices=[Choice(message=ChoiceMessage(content=assistant_text))],
             usage=usage_data,
         )
+        global_capture_manager.enqueue_turn(
+            request_payload=req_dict,
+            response_data=resp.model_dump(),
+            source_agent=x_source_agent,
+            latency_ms=int(duration * 1000),
+            stream=False,
+            conversation_id=non_stream_conv_id,
+        )
+        return resp
+    except Exception:
+        record_chat_completion(req.model, stream=False, status="error", duration=time.time() - t0)
+        raise
     except Exception:
         record_chat_completion(req.model, stream=False, status="error", duration=time.time() - t0)
         raise

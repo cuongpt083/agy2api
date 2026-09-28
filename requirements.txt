@@ -6,4 +6,4 @@ python-multipart
 requests
 python-dotenv
 prometheus-client>=0.20.0
-
+aiosqlite>=0.19.0

@@ -15,6 +15,7 @@ from app.core.metrics import (
     record_http_request,
 )
 from app.core.process_pool import global_pool
+from app.core.capture import global_capture_manager
 
 import uuid
 import logging
@@ -48,11 +49,15 @@ async def lifespan(app: FastAPI):
     model_warmup = asyncio.create_task(get_available_models())
     # Start pre-warming agy worker processes
     pool_task = asyncio.create_task(global_pool.start())
+    # Start zero-overhead capture background worker
+    capture_task = asyncio.create_task(global_capture_manager.start())
     yield
     task.cancel()
     model_warmup.cancel()
     pool_task.cancel()
+    capture_task.cancel()
     await global_pool.shutdown()
+    await global_capture_manager.stop()
 
 app = FastAPI(
     title="AGY OpenAI API Wrapper",

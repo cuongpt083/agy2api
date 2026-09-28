@@ -73,6 +73,8 @@ flowchart LR
 | **Security** | Implements an AGY PreToolUse hook (`safety_gate.py`) to intercept and block dangerous shell commands |
 | **Audio** | Text-to-speech generation via `/v1/audio/speech` (Powered by [capcut-tts-api](https://github.com/K07VN/capcut-tts-api)) |
 | **Operations** | Integrated web UI for managing API keys and viewing logs, Daemon Mode (Docker & Systemd) |
+| **Tool Calling** | Emulates OpenAI function calling (`tools`, `tool_choice`, `tool_calls`, `role: tool`) via `agy --json-schema` |
+| **Metrics** | Built-in Prometheus metrics export via `/metrics` (`prometheus-client>=0.20.0`) |
 
 ## 🚀 Quick Start
 
@@ -89,7 +91,7 @@ cd agy2api
 # Copy example environment file (and then edit it with your secret key)
 cp .env.example .env
 
-# Start the service (use 'docker-compose' for older Docker versions)
+# Start the service (mounts ./app for live development; use 'docker-compose' for older Docker versions)
 docker compose up -d
 
 # View logs
@@ -145,7 +147,8 @@ To enable the safety gate in your local `agy` environment, link or copy `hooks.j
 ## 🔌 API Endpoints
 - `GET /health`
 - `GET /v1/models`
-- `POST /v1/chat/completions`
+- `GET /metrics`
+- `POST /v1/chat/completions` (supports `tools`, `tool_choice`, `max_tokens`, `max_completion_tokens`)
 - `POST /v1/images/generations`
 - `POST /v1/audio/speech`
 - `GET /v1/audio/voices`

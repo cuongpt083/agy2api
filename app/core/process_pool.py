@@ -3,10 +3,13 @@
 Eliminates the 7-9s cold-start overhead (process launch + eligibility check)
 by maintaining pre-warmed agy processes waiting on stdin.
 
-Architecture: Take-and-Replenish (Single-Use Warm Spare)
-Each warm process handles exactly ONE user request and is immediately terminated,
-guaranteeing complete context isolation between requests while delivering
-sub-4s response times.
+Architecture: Take-and-Replenish (Single-Use Warm Spare) + Dynamic Auto-Warm
+- Each warm process handles exactly ONE user request and is immediately terminated,
+  guaranteeing complete context isolation between requests while delivering sub-4s response times.
+- Dynamic Auto-Warm: When users call a new model, the request falls back to cold-spawn safely,
+  while an async background task automatically pre-warms a worker for that model for future calls.
+- Least-Recently-Used (LRU) Eviction: Bounded memory footprint by evicting idle model pools
+  when exceeding AGY_POOL_MAX_DYNAMIC_MODELS.
 """
 
 from __future__ import annotations
@@ -19,8 +22,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,28 +59,38 @@ class WarmWorker:
 class AgyProcessPool:
     """Manages a pool of pre-warmed agy worker processes keyed by model."""
 
-    def __init__(self, target_size: int = 2, default_model: Optional[str] = None):
+    def __init__(self, target_size: int = 1, default_model: Optional[str] = None):
         self.target_size = int(os.environ.get("AGY_POOL_SIZE", str(target_size)))
-        # Read comma-separated models to pre-warm, e.g. AGY_POOL_MODELS="gemini-3.8-flash-high,gemini-3.8-flash-low"
+        self.max_dynamic_models = int(os.environ.get("AGY_POOL_MAX_DYNAMIC_MODELS", "3"))
+
+        # Read configured models to pre-warm on startup
         env_models = os.environ.get("AGY_POOL_MODELS")
         if env_models:
-            self.warm_models = [m.strip() for m in env_models.split(",") if m.strip()]
+            self.warm_models: list[str] = [m.strip() for m in env_models.split(",") if m.strip()]
         else:
-            # Default model or fallback to None (cli default)
-            self.warm_models = [default_model or os.environ.get("AGY_DEFAULT_MODEL", "gemini-3.8-flash-high")]
-        
-        self._pools: dict[Optional[str], asyncio.Queue[WarmWorker]] = {}
+            def_m = default_model or os.environ.get("AGY_DEFAULT_MODEL", "gemini-3.8-flash-high")
+            self.warm_models = [def_m]
+
+        self._pools: dict[str, asyncio.Queue[WarmWorker]] = {}
+        self._last_used: dict[str, float] = {}
         self._running = False
         self._active_workers: list[WarmWorker] = []
+        self._auto_warm_in_progress: set[str] = set()
 
     async def start(self) -> None:
         """Start pre-warming workers in the background."""
         if self._running or self.target_size <= 0:
             return
         self._running = True
-        logger.info("Starting AgyProcessPool (target size: %d per model, models: %s)", self.target_size, self.warm_models)
+        logger.info(
+            "Starting AgyProcessPool (target size: %d per model, initial models: %s, max dynamic: %d)",
+            self.target_size,
+            self.warm_models,
+            self.max_dynamic_models,
+        )
         for m in self.warm_models:
             self._pools[m] = asyncio.Queue()
+            self._last_used[m] = time.time()
             for _ in range(self.target_size):
                 asyncio.create_task(self._spawn_worker_safe(m))
 
@@ -105,7 +117,7 @@ class AgyProcessPool:
                 env=_agy_env(),
             )
 
-            # Read the initial init event to verify readiness
+            # Read initial init event to verify readiness
             init_line = await proc.stdout.readline()
             if not init_line:
                 stderr = await proc.stderr.read()
@@ -129,7 +141,7 @@ class AgyProcessPool:
             shutil.rmtree(prompt_dir, ignore_errors=True)
             return None
 
-    async def _spawn_worker_safe(self, model: Optional[str]) -> None:
+    async def _spawn_worker_safe(self, model: str) -> None:
         if not self._running:
             return
         worker = await self._spawn_one_worker(model)
@@ -143,19 +155,61 @@ class AgyProcessPool:
             if self._running and model in self._pools and self._pools[model].qsize() < self.target_size:
                 asyncio.create_task(self._spawn_worker_safe(model))
 
+    async def _evict_lru_model_if_needed(self, incoming_model: str) -> None:
+        """Evicts the least-recently-used model queue if dynamic pool limit is reached."""
+        if incoming_model in self._pools or len(self._pools) < self.max_dynamic_models:
+            return
+
+        # Find least recently used model (excluding default primary model if possible)
+        primary_model = self.warm_models[0] if self.warm_models else None
+        candidates = [m for m in self._pools if m != primary_model] or list(self._pools.keys())
+        if not candidates:
+            return
+
+        lru_model = min(candidates, key=lambda m: self._last_used.get(m, 0.0))
+        logger.info("Evicting LRU warm model pool: %s to accommodate %s", lru_model, incoming_model)
+
+        q = self._pools.pop(lru_model, None)
+        self._last_used.pop(lru_model, None)
+        if q:
+            while not q.empty():
+                try:
+                    w = q.get_nowait()
+                    if w in self._active_workers:
+                        self._active_workers.remove(w)
+                    await w.close()
+                except Exception:
+                    pass
+
+    async def auto_warm_model(self, model: str) -> None:
+        """Dynamically registers and warms a new model when requested by users."""
+        if not self._running or self.target_size <= 0 or not model:
+            return
+        if model in self._pools or model in self._auto_warm_in_progress:
+            return
+
+        self._auto_warm_in_progress.add(model)
+        try:
+            await self._evict_lru_model_if_needed(model)
+            self._pools[model] = asyncio.Queue()
+            self._last_used[model] = time.time()
+            logger.info("Auto-warming pool for newly requested model: %s", model)
+            for _ in range(self.target_size):
+                asyncio.create_task(self._spawn_worker_safe(model))
+        finally:
+            self._auto_warm_in_progress.discard(model)
+
     async def acquire(self, model: Optional[str] = None) -> Optional[WarmWorker]:
-        """Get a warm worker matching the exact model requested, else None (safe cold fallback)."""
+        """Get a warm worker matching the exact model requested, else trigger auto-warm and return None."""
         if not self._running or self.target_size <= 0:
             return None
 
-        # Normalize model key
-        target_key = None
-        for k in self.warm_models:
-            if k == model or (not model and k == self.warm_models[0]):
-                target_key = k
-                break
-        
-        if target_key is None or target_key not in self._pools:
+        # Resolve model key
+        target_key = model or (self.warm_models[0] if self.warm_models else "gemini-3.8-flash-high")
+
+        # If model is not yet in our warm pools, trigger dynamic auto-warm for subsequent requests
+        if target_key not in self._pools:
+            asyncio.create_task(self.auto_warm_model(target_key))
             return None
 
         q = self._pools[target_key]
@@ -164,6 +218,7 @@ class AgyProcessPool:
 
         try:
             worker = q.get_nowait()
+            self._last_used[target_key] = time.time()
             if worker in self._active_workers:
                 self._active_workers.remove(worker)
 
@@ -195,6 +250,7 @@ class AgyProcessPool:
             await worker.close()
         self._active_workers.clear()
         self._pools.clear()
+        self._last_used.clear()
 
 
 # Global pool singleton

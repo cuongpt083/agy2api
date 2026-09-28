@@ -73,6 +73,8 @@ flowchart LR
 | **Bảo mật** | Tích hợp hook AGY PreToolUse (`safety_gate.py`) giúp phân tích và chặn các lệnh shell nguy hiểm |
 | **Âm thanh** | Hỗ trợ Text-to-Speech (TTS) thông qua `/v1/audio/speech` (Dựa trên mã nguồn [capcut-tts-api](https://github.com/K07VN/capcut-tts-api)) |
 | **Vận hành** | Có sẵn giao diện Web UI để quản lý API keys, xem logs, hỗ trợ chạy nền qua Docker hoặc Systemd |
+| **Gọi công cụ (Tool Calling)** | Giả lập OpenAI function/tool calling (`tools`, `tool_choice`, `tool_calls`, `role: tool`) thông qua `agy --json-schema` |
+| **Giám sát (Metrics)** | Tích hợp sẵn xuất số liệu Prometheus qua `/metrics` (`prometheus-client>=0.20.0`) |
 
 ## 🚀 Hướng dẫn Nhanh
 
@@ -89,7 +91,7 @@ cd agy2api
 # Copy file biến môi trường mẫu (sau đó bạn cần sửa lại key)
 cp .env.example .env
 
-# Khởi chạy dịch vụ (sử dụng 'docker compose' cho Docker bản mới trên Mac/Linux)
+# Khởi chạy dịch vụ (hỗ trợ live development qua mount ./app; sử dụng 'docker compose' cho Docker bản mới trên Mac/Linux)
 docker compose up -d
 
 # Xem log
@@ -145,7 +147,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## 🔌 Các Endpoint Chính
 - `GET /health`
 - `GET /v1/models`
-- `POST /v1/chat/completions`
+- `GET /metrics`
+- `POST /v1/chat/completions` (hỗ trợ `tools`, `tool_choice`, `max_tokens`, `max_completion_tokens`)
 - `POST /v1/images/generations`
 - `POST /v1/audio/speech`
 - `GET /v1/audio/voices`

@@ -9,6 +9,10 @@ services:
       - study
     environment:
       - AGY_API_KEY=sk-dummy
+      - AGY_POOL_SIZE=1
+      - AGY_DEFAULT_MODEL=gemini-3.8-flash-high
+      - AGY_POOL_MODELS=gemini-3.8-flash-high
+      - AGY_POOL_MAX_DYNAMIC_MODELS=3
     volumes:
       - ./app:/app/app:ro
       - ~/.gemini:/root/.gemini

@@ -14,6 +14,7 @@ from app.core.metrics import (
     expose_metrics,
     record_http_request,
 )
+from app.core.process_pool import global_pool
 
 import uuid
 import logging
@@ -45,9 +46,13 @@ async def agy_garbage_collector():
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(agy_garbage_collector())
     model_warmup = asyncio.create_task(get_available_models())
+    # Start pre-warming agy worker processes
+    pool_task = asyncio.create_task(global_pool.start())
     yield
     task.cancel()
     model_warmup.cancel()
+    pool_task.cancel()
+    await global_pool.shutdown()
 
 app = FastAPI(
     title="AGY OpenAI API Wrapper",

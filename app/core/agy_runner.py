@@ -7,8 +7,10 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from app.core.metrics import record_runner_execution
+from app.core.process_pool import global_pool, WarmWorker
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +110,66 @@ async def _drain_stderr(process: asyncio.subprocess.Process) -> bytes:
     return b"".join(chunks)
 
 
+async def stream_agy_prompt_pooled(
+    worker: WarmWorker,
+    prompt: str,
+    model: str = None,
+    stop_after_first_schema_object: bool = False,
+):
+    """Execute a single turn on a pre-warmed agy process using stdin stream-json."""
+    from app.core.tool_emulation import first_json_object
+
+    t0 = time.time()
+    proc = worker.process
+    stderr_task = asyncio.create_task(_drain_stderr(proc))
+
+    try:
+        # Send user prompt as JSON event over stdin
+        user_event = {"event": "user", "message": {"content": prompt}}
+        payload = json.dumps(user_event, ensure_ascii=False) + "\n"
+        proc.stdin.write(payload.encode("utf-8"))
+        await proc.stdin.drain()
+
+        accumulated = ""
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            if not text:
+                continue
+            try:
+                event = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+            yield event
+
+            if stop_after_first_schema_object:
+                step = event.get("step_update") or {}
+                if event.get("event") == "step_update" and step.get("step_type") == "agent_response":
+                    accumulated += step.get("text_delta") or ""
+                    if first_json_object(accumulated):
+                        break
+
+            if event.get("event") == "result":
+                break
+
+        record_runner_execution(model or "default", "stream-json-warm", "success", time.time() - t0)
+    except Exception:
+        record_runner_execution(model or "default", "stream-json-warm", "error", time.time() - t0)
+        raise
+    finally:
+        # Single-use warm worker: always terminate after turn to guarantee 100% context isolation
+        await worker.close()
+        if stderr_task and not stderr_task.done():
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except asyncio.CancelledError:
+                pass
+
+
 async def run_agy_prompt(
     prompt: str,
     model: str = None,
@@ -117,9 +179,21 @@ async def run_agy_prompt(
     json_schema: dict | str | None = None,
 ):
     """
-    Safely executes the `agy` CLI using asyncio subprocess to avoid blocking.
-    extra_dirs are --add-dir paths owned by the caller; only prompt_dir is deleted.
+    Safely executes the `agy` CLI using warm pool if available, otherwise cold spawn.
     """
+    # If standard text completion with no special extra_dirs or json_schema, try warm pool
+    if not extra_dirs and not json_schema:
+        worker = await global_pool.acquire(model)
+        if worker:
+            logger.info("Using warm worker for run_agy_prompt (pid: %d)", worker.process.pid)
+            final_result = None
+            async for event in stream_agy_prompt_pooled(worker, prompt, model):
+                if event.get("event") == "result":
+                    final_result = event.get("result")
+            if final_result is not None:
+                return final_result
+
+    # Fallback to cold spawn
     inv = build_agy_invocation(
         prompt, model, output_format, extra_dirs=extra_dirs, json_schema=json_schema
     )
@@ -167,14 +241,18 @@ async def stream_agy_prompt(
     json_schema: dict | str | None = None,
     stop_after_first_schema_object: bool = False,
 ):
-    """Yield parsed NDJSON events from `agy --output-format stream-json`.
+    """Yield parsed NDJSON events from warm pool or cold spawn."""
+    if not extra_dirs and not json_schema:
+        worker = await global_pool.acquire(model)
+        if worker:
+            logger.info("Using warm worker for stream_agy_prompt (pid: %d)", worker.process.pid)
+            async for event in stream_agy_prompt_pooled(
+                worker, prompt, model, stop_after_first_schema_object=stop_after_first_schema_object
+            ):
+                yield event
+            return
 
-    When stop_after_first_schema_object is True (OpenAI tools emulation), kill
-    the process after the first agent_response that contains a complete JSON
-    object so agy cannot retry the virtual tool for extra turns.
-    """
-    from app.core.tool_emulation import first_json_object
-
+    # Fallback to cold spawn
     inv = build_agy_invocation(
         prompt, model, "stream-json", extra_dirs=extra_dirs, json_schema=json_schema
     )
@@ -211,6 +289,7 @@ async def stream_agy_prompt(
                 step = event.get("step_update") or {}
                 if event.get("event") == "step_update" and step.get("step_type") == "agent_response":
                     accumulated += step.get("text_delta") or ""
+                    from app.core.tool_emulation import first_json_object
                     if first_json_object(accumulated):
                         stopped_early = True
                         process.kill()

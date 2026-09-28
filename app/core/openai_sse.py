@@ -109,3 +109,68 @@ def events_to_sse_bytes(events: list[dict], chat_id: str, created: int, model: s
         )
 
     yield format_sse("[DONE]")
+
+
+def events_to_sse_bytes_with_tools(events: list[dict], chat_id: str, created: int, model: str):
+    """Buffer schema JSON (do not stream it as content), then emit tool_calls or message."""
+    from app.core.tool_emulation import parse_emulated_output, to_openai_tool_calls
+
+    sent = ""
+    result = None
+    usage = None
+
+    for event in events:
+        piece, sent = extract_agent_text_delta(event, sent)
+        if event.get("event") == "result":
+            result = event.get("result") or {}
+            usage = result.get("usage")
+
+    raw = sent
+    if result is not None:
+        raw = result.get("response") or result.get("text") or sent
+        if result.get("structured_output"):
+            parsed = parse_emulated_output(raw, result.get("structured_output"))
+        else:
+            parsed = parse_emulated_output(raw)
+    else:
+        parsed = parse_emulated_output(sent)
+
+    mapped_usage = usage_from_agy(usage)
+    if parsed.get("kind") == "tool_call":
+        tool_calls = [
+            {**tc, "index": i} for i, tc in enumerate(to_openai_tool_calls(parsed))
+        ]
+        yield format_sse(
+            openai_chunk(
+                chat_id,
+                created,
+                model,
+                {"role": "assistant", "tool_calls": tool_calls},
+            )
+        )
+        yield format_sse(
+            openai_chunk(
+                chat_id,
+                created,
+                model,
+                {},
+                finish_reason="tool_calls",
+                usage=mapped_usage,
+            )
+        )
+    else:
+        content = parsed.get("content") or ""
+        yield format_sse(
+            openai_chunk(chat_id, created, model, {"role": "assistant", "content": content})
+        )
+        yield format_sse(
+            openai_chunk(
+                chat_id,
+                created,
+                model,
+                {},
+                finish_reason="stop",
+                usage=mapped_usage,
+            )
+        )
+    yield format_sse("[DONE]")

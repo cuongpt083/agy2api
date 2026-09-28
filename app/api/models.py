@@ -2,14 +2,28 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
 
 class Message(BaseModel):
-    role: str = Field(..., description="The role of the messages author, e.g. user, assistant, or system")
-    content: Union[str, List[Dict[str, Any]]] = Field(..., description="The contents of the message. Can be a string or an array of content parts (for multimodal inputs like images).")
+    role: str = Field(..., description="The role of the messages author, e.g. user, assistant, system, or tool")
+    content: Optional[Union[str, List[Dict[str, Any]]]] = Field(
+        None,
+        description="The contents of the message. Optional when the assistant emitted tool_calls or the role is tool.",
+    )
+    tool_calls: Optional[List[Dict[str, Any]]] = Field(
+        None, description="OpenAI tool_calls on an assistant message."
+    )
+    tool_call_id: Optional[str] = Field(None, description="For role=tool: the id of the tool call this result answers.")
+    name: Optional[str] = Field(None, description="For role=tool: the function name.")
 
 class ChatCompletionRequest(BaseModel):
     model: str = Field(..., description="ID of the model to use, e.g. 'Gemini 3.6 Flash (High)'")
     messages: List[Message]
     temperature: Optional[float] = Field(1.0, description="Sampling temperature")
     stream: Optional[bool] = Field(False, description="Whether to stream back partial progress")
+    tools: Optional[List[Dict[str, Any]]] = Field(
+        None, description="OpenAI tools array. Forwarded to AGY via --json-schema emulation."
+    )
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(
+        None, description="auto | none | required | {type:function, function:{name}}"
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -54,9 +68,21 @@ class ChatCompletionRequest(BaseModel):
         }
     }
 
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: FunctionCall
+
+
 class ChoiceMessage(BaseModel):
     role: str = "assistant"
-    content: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 class Choice(BaseModel):
     index: int = 0

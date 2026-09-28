@@ -29,6 +29,7 @@ def build_agy_invocation(
     model: str | None,
     output_format: str,
     extra_dirs: list[str] | None = None,
+    json_schema: dict | str | None = None,
 ) -> AgyInvocation:
     prompt_dir = tempfile.mkdtemp(prefix="agy2api-prompt-")
     prompt_path = str(Path(prompt_dir) / _PROMPT_FILENAME)
@@ -50,11 +51,24 @@ def build_agy_invocation(
         "--print-timeout",
         "10m",
     ]
+    if json_schema is not None:
+        schema_path = str(Path(prompt_dir) / "schema.json")
+        if isinstance(json_schema, str):
+            Path(schema_path).write_text(json_schema, encoding="utf-8")
+        else:
+            Path(schema_path).write_text(json.dumps(json_schema), encoding="utf-8")
+        cmd.extend(["--json-schema", schema_path])
     for extra in extra_dirs or []:
         cmd.extend(["--add-dir", extra])
     if model:
         cmd.extend(["--model", model])
     return AgyInvocation(cmd=cmd, prompt_dir=prompt_dir, prompt_path=prompt_path)
+
+
+def _agy_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["AGY_IS_API_CALL"] = "1"
+    return env
 
 
 def _log_agy_cmd(inv: AgyInvocation, kind: str) -> None:
@@ -99,18 +113,22 @@ async def run_agy_prompt(
     output_format: str = "json",
     files: list[str] = None,
     extra_dirs: list[str] | None = None,
+    json_schema: dict | str | None = None,
 ):
     """
     Safely executes the `agy` CLI using asyncio subprocess to avoid blocking.
     extra_dirs are --add-dir paths owned by the caller; only prompt_dir is deleted.
     """
-    inv = build_agy_invocation(prompt, model, output_format, extra_dirs=extra_dirs)
+    inv = build_agy_invocation(
+        prompt, model, output_format, extra_dirs=extra_dirs, json_schema=json_schema
+    )
     _log_agy_cmd(inv, "command")
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_agy_env(),
         )
 
         stdout, stderr = await process.communicate()
@@ -138,20 +156,34 @@ async def stream_agy_prompt(
     model: str = None,
     files: list[str] = None,
     extra_dirs: list[str] | None = None,
+    json_schema: dict | str | None = None,
+    stop_after_first_schema_object: bool = False,
 ):
-    """Yield parsed NDJSON events from `agy --output-format stream-json`."""
-    inv = build_agy_invocation(prompt, model, "stream-json", extra_dirs=extra_dirs)
+    """Yield parsed NDJSON events from `agy --output-format stream-json`.
+
+    When stop_after_first_schema_object is True (OpenAI tools emulation), kill
+    the process after the first agent_response that contains a complete JSON
+    object so agy cannot retry the virtual tool for extra turns.
+    """
+    from app.core.tool_emulation import first_json_object
+
+    inv = build_agy_invocation(
+        prompt, model, "stream-json", extra_dirs=extra_dirs, json_schema=json_schema
+    )
     _log_agy_cmd(inv, "stream")
     process = None
     stderr_task = None
+    stopped_early = False
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_agy_env(),
         )
         stderr_task = asyncio.create_task(_drain_stderr(process))
 
+        accumulated = ""
         while True:
             line = await process.stdout.readline()
             if not line:
@@ -160,12 +192,24 @@ async def stream_agy_prompt(
             if not text:
                 continue
             try:
-                yield json.loads(text)
+                event = json.loads(text)
             except json.JSONDecodeError:
                 logger.warning("Skipping non-JSON AGY stream line: %s", text[:200])
+                continue
+            yield event
+            if stop_after_first_schema_object:
+                step = event.get("step_update") or {}
+                if event.get("event") == "step_update" and step.get("step_type") == "agent_response":
+                    accumulated += step.get("text_delta") or ""
+                    if first_json_object(accumulated):
+                        stopped_early = True
+                        process.kill()
+                        break
 
         await process.wait()
         stderr = await stderr_task
+        if stopped_early:
+            return
         if process.returncode != 0:
             error_msg = stderr.decode().strip()
             logger.error(f"AGY Error: {error_msg}")

@@ -33,5 +33,6 @@ class TestAgyInvocationArgv(unittest.TestCase):
             self.assertEqual(inv.cmd[inv.cmd.index("--output-format") + 1], "stream-json")
             self.assertNotIn("hello", inv.cmd)
             self.assertEqual(Path(inv.prompt_path).read_text(encoding="utf-8"), "hello")
+            self.assertNotIn("--json-schema", inv.cmd)
         finally:
             inv.cleanup()

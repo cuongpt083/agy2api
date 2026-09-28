@@ -16,15 +16,24 @@ from app.api.models import (
     ImageGenerationRequest,
     ImageGenerationResponse,
     ImageObject,
+    ToolCall,
 )
 from app.core.security import get_api_key
 from app.core.agy_runner import run_agy_prompt, stream_agy_prompt
 from app.core.openai_sse import (
     extract_agent_text_delta,
+    events_to_sse_bytes_with_tools,
     format_sse,
     next_text_delta,
     openai_chunk,
     usage_from_agy,
+)
+from app.core.tool_emulation import (
+    TOOLS_JSON_SCHEMA,
+    format_history_message,
+    format_tools_preamble,
+    parse_emulated_output,
+    to_openai_tool_calls,
 )
 import logging
 import re
@@ -80,7 +89,13 @@ def build_chat_prompt(req: ChatCompletionRequest, file_mgr: TempFileManager) -> 
     prompt_lines = []
     files_to_attach = []
 
+    if req.tools:
+        prompt_lines.append(format_tools_preamble(req.tools, req.tool_choice).rstrip())
+
     for msg in req.messages:
+        if msg.tool_calls or (msg.role or "").lower() == "tool":
+            prompt_lines.append(format_history_message(msg))
+            continue
         if isinstance(msg.content, str):
             prompt_lines.append(f"{msg.role.capitalize()}: {msg.content}")
         elif isinstance(msg.content, list):
@@ -112,11 +127,28 @@ def _assistant_text(agy_response) -> str:
     return str(agy_response)
 
 
-async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, file_mgr: TempFileManager):
+async def _sse_chat_stream(
+    prompt: str,
+    model: str,
+    chat_id: str,
+    created: int,
+    file_mgr: TempFileManager,
+    emulate_tools: bool = False,
+):
     sent = ""
     role_sent = False
+    events: list[dict] = []
     try:
-        async for event in stream_agy_prompt(prompt=prompt, model=model):
+        agen = stream_agy_prompt(
+            prompt=prompt,
+            model=model,
+            json_schema=TOOLS_JSON_SCHEMA if emulate_tools else None,
+            stop_after_first_schema_object=emulate_tools,
+        )
+        async for event in agen:
+            if emulate_tools:
+                events.append(event)
+                continue
             piece, sent = extract_agent_text_delta(event, sent)
             if piece:
                 delta = {"content": piece}
@@ -145,7 +177,11 @@ async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, 
                     usage=usage_from_agy(result.get("usage")),
                 )
             )
-        yield format_sse("[DONE]")
+        if emulate_tools:
+            for frame in events_to_sse_bytes_with_tools(events, chat_id, created, model):
+                yield frame
+        else:
+            yield format_sse("[DONE]")
     except Exception as e:
         logger.error("AGY stream failed: %s", e, exc_info=True)
         err = {
@@ -160,17 +196,21 @@ async def _sse_chat_stream(prompt: str, model: str, chat_id: str, created: int, 
         file_mgr.cleanup()
 
 
-@router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE.")
+@router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE. Pass OpenAI `tools` to emulate function calling via agy --json-schema.")
 async def chat_completions(req: ChatCompletionRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
-    logger.info(f"Processing chat completions for model: {req.model} stream={req.stream}")
+    logger.info(f"Processing chat completions for model: {req.model} stream={req.stream} tools={bool(req.tools)}")
     file_mgr = TempFileManager()
     final_prompt, files_to_attach = build_chat_prompt(req, file_mgr)
+    emulate_tools = bool(req.tools) and req.tool_choice != "none"
+    schema = TOOLS_JSON_SCHEMA if emulate_tools else None
 
     if req.stream:
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         return StreamingResponse(
-            _sse_chat_stream(final_prompt, req.model, chat_id, created, file_mgr),
+            _sse_chat_stream(
+                final_prompt, req.model, chat_id, created, file_mgr, emulate_tools=emulate_tools
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -180,8 +220,12 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
         )
 
     background_tasks.add_task(file_mgr.cleanup)
-    agy_response = await run_agy_prompt(prompt=final_prompt, model=req.model, files=files_to_attach)
-    assistant_text = _assistant_text(agy_response)
+    agy_response = await run_agy_prompt(
+        prompt=final_prompt,
+        model=req.model,
+        files=files_to_attach,
+        json_schema=schema,
+    )
     usage_data = Usage()
     if isinstance(agy_response, dict) and agy_response.get("usage"):
         mapped = usage_from_agy(agy_response.get("usage"))
@@ -190,6 +234,28 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
             completion_tokens=mapped["completion_tokens"],
             total_tokens=mapped["total_tokens"],
         )
+
+    if emulate_tools and isinstance(agy_response, dict):
+        raw = agy_response.get("response") or agy_response.get("text") or agy_response.get("content") or ""
+        parsed = parse_emulated_output(str(raw), agy_response.get("structured_output"))
+        if parsed.get("kind") == "tool_call":
+            tcs = [ToolCall(**tc) for tc in to_openai_tool_calls(parsed)]
+            return ChatCompletionResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                created=int(time.time()),
+                model=req.model,
+                choices=[
+                    Choice(
+                        message=ChoiceMessage(content=None, tool_calls=tcs),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=usage_data,
+            )
+        assistant_text = parsed.get("content") or ""
+    else:
+        assistant_text = _assistant_text(agy_response)
+
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
         created=int(time.time()),

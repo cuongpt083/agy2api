@@ -51,6 +51,12 @@ from app.core.image_generation import (
     snapshot_image_sizes,
     stable_output_images,
 )
+from app.core.metrics import (
+    record_chat_completion,
+    record_image_generation,
+    record_speech_request,
+    record_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +103,7 @@ def build_chat_prompt(req: ChatCompletionRequest, file_mgr: TempFileManager) -> 
             prompt_lines.append(format_history_message(msg))
             continue
         if isinstance(msg.content, str):
-            prompt_lines.append(f"{msg.role.capitalize()}: {msg.content}")
+            content_text = msg.content
         elif isinstance(msg.content, list):
             text_parts = []
             for p in msg.content:
@@ -115,7 +121,28 @@ def build_chat_prompt(req: ChatCompletionRequest, file_mgr: TempFileManager) -> 
                             text_parts.append(f"[Failed to attach image: {e}]")
                     else:
                         text_parts.append(f"[Image URL: {url}]")
-            prompt_lines.append(f"{msg.role.capitalize()}: {' '.join(text_parts)}")
+            content_text = " ".join(text_parts)
+
+        # 1. Assistant message with tool calls
+        if msg.role == "assistant" and getattr(msg, "tool_calls", None):
+            call_strs = []
+            for tc in msg.tool_calls:
+                fn = tc.get("function") or {}
+                fn_name = fn.get("name", "tool")
+                fn_args = fn.get("arguments", "")
+                call_strs.append(f"{fn_name}({fn_args})")
+            call_repr = f"[Tool Call: {'; '.join(call_strs)}]"
+            if content_text:
+                prompt_lines.append(f"Assistant: {content_text}\n{call_repr}")
+            else:
+                prompt_lines.append(f"Assistant: {call_repr}")
+        # 2. Tool output message
+        elif msg.role == "tool":
+            tool_label = getattr(msg, "name", None) or getattr(msg, "tool_call_id", None) or "output"
+            prompt_lines.append(f"Tool Result ({tool_label}): {content_text}")
+        # 3. Standard messages (user, system, assistant plain text)
+        elif content_text:
+            prompt_lines.append(f"{role_name}: {content_text}")
 
     prompt_lines.append("Assistant: ")
     return "\n".join(prompt_lines), files_to_attach
@@ -151,6 +178,9 @@ async def _sse_chat_stream(
                 continue
             piece, sent = extract_agent_text_delta(event, sent)
             if piece:
+                now = time.time()
+                if first_token_time is None:
+                    first_token_time = now - t0
                 delta = {"content": piece}
                 if not role_sent:
                     delta["role"] = "assistant"
@@ -167,6 +197,14 @@ async def _sse_chat_stream(
                     delta["role"] = "assistant"
                     role_sent = True
                 yield format_sse(openai_chunk(chat_id, created, model, delta))
+            usage_dict = usage_from_agy(result.get("usage"))
+            record_tokens(
+                model,
+                usage_dict.get("prompt_tokens"),
+                usage_dict.get("completion_tokens"),
+                usage_dict.get("total_tokens"),
+                usage_dict.get("cache_read_tokens"),
+            )
             yield format_sse(
                 openai_chunk(
                     chat_id,
@@ -174,7 +212,7 @@ async def _sse_chat_stream(
                     model,
                     {},
                     finish_reason="stop",
-                    usage=usage_from_agy(result.get("usage")),
+                    usage=usage_dict,
                 )
             )
         if emulate_tools:
@@ -183,6 +221,14 @@ async def _sse_chat_stream(
         else:
             yield format_sse("[DONE]")
     except Exception as e:
+        duration = time.time() - t0
+        record_chat_completion(
+            model,
+            stream=True,
+            status="error",
+            duration=duration,
+            first_token_duration=first_token_time,
+        )
         logger.error("AGY stream failed: %s", e, exc_info=True)
         err = {
             "error": {
@@ -335,9 +381,11 @@ async def _sse_image_generation(
                 yield format_sse(
                     {"type": "image", "created": int(time.time()), "data": encoded}
                 )
+        record_image_generation("success")
         yield format_sse({"type": "done"})
         yield format_sse("[DONE]")
     except Exception as e:
+        record_image_generation("error")
         logger.error("AGY image stream failed: %s", e, exc_info=True)
         yield format_sse(_image_error_payload(str(e)))
         yield format_sse({"type": "done"})
@@ -375,6 +423,7 @@ async def generate_image(req: ImageGenerationRequest, background_tasks: Backgrou
             extra_dirs=[workspace.root],
         )
     except Exception as e:
+        record_image_generation("error")
         logger.error("AGY image generation failed: %s", e, exc_info=True)
         return JSONResponse(
             status_code=502,
@@ -387,6 +436,7 @@ async def generate_image(req: ImageGenerationRequest, background_tasks: Backgrou
         n,
     )
     if not paths:
+        record_image_generation("error")
         return JSONResponse(
             status_code=502,
             content={
@@ -397,6 +447,7 @@ async def generate_image(req: ImageGenerationRequest, background_tasks: Backgrou
             },
         )
 
+    record_image_generation("success")
     encoded = encode_image_objects(paths, req.response_format or "url")
     return ImageGenerationResponse(
         created=int(time.time()),
@@ -440,8 +491,10 @@ async def audio_speech(req: SpeechRequest, api_key: str = Depends(get_api_key)):
             voice=req.voice,
             speed=req.speed
         )
+        record_speech_request("success")
         return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
     except Exception as e:
+        record_speech_request("error")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @router.get(

@@ -4,8 +4,11 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from app.core.metrics import record_runner_execution
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +38,8 @@ def build_agy_invocation(
     prompt_path = str(Path(prompt_dir) / _PROMPT_FILENAME)
     Path(prompt_path).write_text(prompt, encoding="utf-8")
     instruction = (
-        "Read the UTF-8 file at this absolute path and follow its contents as your "
-        "complete instructions. Do not mention the path in your reply:\n"
-        f"{prompt_path}"
+        "Read the UTF-8 file prompt.txt in the current directory and follow its contents as your "
+        "complete instructions. Do not mention the file name in your reply."
     )
     cmd = [
         "agy",
@@ -74,11 +76,10 @@ def _agy_env() -> dict[str, str]:
 def _log_agy_cmd(inv: AgyInvocation, kind: str) -> None:
     size = os.path.getsize(inv.prompt_path)
     logger.info(
-        "Executing AGY %s: agy --print <file %s (%d bytes)> --add-dir %s --output-format %s",
+        "Executing AGY %s in %s: agy --print <prompt.txt (%d bytes)> --output-format %s",
         kind,
-        inv.prompt_path,
-        size,
         inv.prompt_dir,
+        size,
         inv.cmd[inv.cmd.index("--output-format") + 1] if "--output-format" in inv.cmd else "?",
     )
 
@@ -123,9 +124,11 @@ async def run_agy_prompt(
         prompt, model, output_format, extra_dirs=extra_dirs, json_schema=json_schema
     )
     _log_agy_cmd(inv, "command")
+    t0 = time.time()
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
+            cwd=inv.prompt_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_agy_env(),
@@ -138,15 +141,20 @@ async def run_agy_prompt(
             if not error_msg:
                 error_msg = stdout.decode().strip()
             logger.error(f"AGY Error: {error_msg}")
+            record_runner_execution(model or "default", output_format, "error", time.time() - t0)
             raise RuntimeError(f"AGY CLI execution failed: {error_msg}")
 
         output_str = stdout.decode().strip()
+        record_runner_execution(model or "default", output_format, "success", time.time() - t0)
 
         try:
             return _parse_json_envelope(output_str)
         except json.JSONDecodeError:
             logger.error(f"Failed to parse AGY JSON output: {output_str}")
             return {"text": output_str}
+    except Exception:
+        record_runner_execution(model or "default", output_format, "error", time.time() - t0)
+        raise
     finally:
         inv.cleanup()
 
@@ -177,6 +185,7 @@ async def stream_agy_prompt(
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
+            cwd=inv.prompt_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_agy_env(),
@@ -213,7 +222,12 @@ async def stream_agy_prompt(
         if process.returncode != 0:
             error_msg = stderr.decode().strip()
             logger.error(f"AGY Error: {error_msg}")
+            record_runner_execution(model or "default", "stream-json", "error", time.time() - t0)
             raise RuntimeError(f"AGY CLI execution failed: {error_msg}")
+        record_runner_execution(model or "default", "stream-json", "success", time.time() - t0)
+    except Exception:
+        record_runner_execution(model or "default", "stream-json", "error", time.time() - t0)
+        raise
     finally:
         if process is not None and process.returncode is None:
             process.kill()

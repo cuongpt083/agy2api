@@ -5,3 +5,5 @@ httpx
 python-multipart
 requests
 python-dotenv
+prometheus-client>=0.20.0
+

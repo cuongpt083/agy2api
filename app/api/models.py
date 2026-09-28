@@ -26,6 +26,7 @@ class ChatCompletionRequest(BaseModel):
     )
 
     model_config = {
+        "extra": "ignore",
         "json_schema_extra": {
             "description": "Để đính kèm file (hình ảnh, tài liệu pdf, docx, txt...), hãy sử dụng mảng content và truyền chuỗi base64 dạng data URI (vd: data:image/jpeg;base64,... hoặc data:application/pdf;base64,...) vào trường image_url. Mặc dù chuẩn gốc là image_url, hệ thống hỗ trợ phân giải tự động các loại file khác dựa vào mime type trong data URI.",
             "examples": [
@@ -93,6 +94,9 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cache_read_tokens: int = 0
+    prompt_tokens_details: Optional[Dict[str, Any]] = None
+    completion_tokens_details: Optional[Dict[str, Any]] = None
 
 class ChatCompletionResponse(BaseModel):
     id: str

@@ -2,6 +2,7 @@ import asyncio
 import time
 import uuid
 import io
+from typing import Optional
 from fastapi import APIRouter, Depends, BackgroundTasks, UploadFile, File, Form, Header
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from app.api.models import (

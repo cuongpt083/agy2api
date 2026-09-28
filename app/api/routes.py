@@ -166,6 +166,8 @@ async def _sse_chat_stream(
     sent = ""
     role_sent = False
     events: list[dict] = []
+    t0 = time.time()
+    first_token_time = None
     try:
         agen = stream_agy_prompt(
             prompt=prompt,
@@ -216,7 +218,25 @@ async def _sse_chat_stream(
                     usage=usage_dict,
                 )
             )
+        duration = time.time() - t0
+        record_chat_completion(
+            model,
+            stream=True,
+            status="success",
+            duration=duration,
+            first_token_duration=first_token_time,
+        )
         if emulate_tools:
+            res_evt = next((e.get("result") for e in events if e.get("event") == "result"), None)
+            if res_evt and res_evt.get("usage"):
+                u = usage_from_agy(res_evt.get("usage"))
+                record_tokens(
+                    model,
+                    u.get("prompt_tokens"),
+                    u.get("completion_tokens"),
+                    u.get("total_tokens"),
+                    u.get("cache_read_tokens"),
+                )
             for frame in events_to_sse_bytes_with_tools(events, chat_id, created, model):
                 yield frame
         else:
@@ -267,49 +287,66 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
         )
 
     background_tasks.add_task(file_mgr.cleanup)
-    agy_response = await run_agy_prompt(
-        prompt=final_prompt,
-        model=req.model,
-        files=files_to_attach,
-        json_schema=schema,
-    )
-    usage_data = Usage()
-    if isinstance(agy_response, dict) and agy_response.get("usage"):
-        mapped = usage_from_agy(agy_response.get("usage"))
-        usage_data = Usage(
-            prompt_tokens=mapped["prompt_tokens"],
-            completion_tokens=mapped["completion_tokens"],
-            total_tokens=mapped["total_tokens"],
+    t0 = time.time()
+    try:
+        agy_response = await run_agy_prompt(
+            prompt=final_prompt,
+            model=req.model,
+            files=files_to_attach,
+            json_schema=schema,
         )
-
-    if emulate_tools and isinstance(agy_response, dict):
-        raw = agy_response.get("response") or agy_response.get("text") or agy_response.get("content") or ""
-        parsed = parse_emulated_output(str(raw), agy_response.get("structured_output"))
-        if parsed.get("kind") == "tool_call":
-            tcs = [ToolCall(**tc) for tc in to_openai_tool_calls(parsed)]
-            return ChatCompletionResponse(
-                id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                created=int(time.time()),
-                model=req.model,
-                choices=[
-                    Choice(
-                        message=ChoiceMessage(content=None, tool_calls=tcs),
-                        finish_reason="tool_calls",
-                    )
-                ],
-                usage=usage_data,
+        duration = time.time() - t0
+        usage_data = Usage()
+        if isinstance(agy_response, dict) and agy_response.get("usage"):
+            mapped = usage_from_agy(agy_response.get("usage"))
+            usage_data = Usage(
+                prompt_tokens=mapped.get("prompt_tokens", 0),
+                completion_tokens=mapped.get("completion_tokens", 0),
+                total_tokens=mapped.get("total_tokens", 0),
+                cache_read_tokens=mapped.get("cache_read_tokens", 0),
+                prompt_tokens_details=mapped.get("prompt_tokens_details"),
+                completion_tokens_details=mapped.get("completion_tokens_details"),
             )
-        assistant_text = parsed.get("content") or ""
-    else:
-        assistant_text = _assistant_text(agy_response)
+            record_tokens(
+                req.model,
+                usage_data.prompt_tokens,
+                usage_data.completion_tokens,
+                usage_data.total_tokens,
+                usage_data.cache_read_tokens,
+            )
+        record_chat_completion(req.model, stream=False, status="success", duration=duration)
 
-    return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
-        created=int(time.time()),
-        model=req.model,
-        choices=[Choice(message=ChoiceMessage(content=assistant_text))],
-        usage=usage_data,
-    )
+        if emulate_tools and isinstance(agy_response, dict):
+            raw = agy_response.get("response") or agy_response.get("text") or agy_response.get("content") or ""
+            parsed = parse_emulated_output(str(raw), agy_response.get("structured_output"))
+            if parsed.get("kind") == "tool_call":
+                tcs = [ToolCall(**tc) for tc in to_openai_tool_calls(parsed)]
+                return ChatCompletionResponse(
+                    id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    created=int(time.time()),
+                    model=req.model,
+                    choices=[
+                        Choice(
+                            message=ChoiceMessage(content=None, tool_calls=tcs),
+                            finish_reason="tool_calls",
+                        )
+                    ],
+                    usage=usage_data,
+                )
+            assistant_text = parsed.get("content") or ""
+        else:
+            assistant_text = _assistant_text(agy_response)
+
+        return ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            created=int(time.time()),
+            model=req.model,
+            choices=[Choice(message=ChoiceMessage(content=assistant_text))],
+            usage=usage_data,
+        )
+    except Exception:
+        record_chat_completion(req.model, stream=False, status="error", duration=time.time() - t0)
+        raise
 
 def _prepare_image_job(req: ImageGenerationRequest) -> tuple[ImageWorkspace, str, int]:
     n = clamp_n(req.n)

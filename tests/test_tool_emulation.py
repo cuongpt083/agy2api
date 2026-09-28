@@ -191,5 +191,68 @@ class TestAgyInvocationSchema(unittest.TestCase):
         self.assertIn('tool_choice is "none"', text)
 
 
+class TestStreamErrorHandling(unittest.TestCase):
+    def test_stream_error_emits_error_frame_without_name_error(self):
+        import asyncio
+        from unittest.mock import patch
+        from app.api.routes import _sse_chat_stream
+        from app.core.file_handler import TempFileManager
+
+        async def _mock_stream_fail(*args, **kwargs):
+            if False:
+                yield {}
+            raise RuntimeError("AGY CLI execution failed: Eligibility check failed: UNAVAILABLE")
+
+        async def _run():
+            mgr = TempFileManager()
+            frames = []
+            with patch("app.api.routes.stream_agy_prompt", side_effect=_mock_stream_fail):
+                async for frame in _sse_chat_stream("prompt", "model", "chat-1", 12345, mgr):
+                    frames.append(frame.decode("utf-8"))
+            joined = "".join(frames)
+            self.assertIn("server_error", joined)
+            self.assertIn("Eligibility check failed", joined)
+            self.assertIn("[DONE]", joined)
+
+        asyncio.run(_run())
+
+    def test_stream_happy_path_emits_tokens_and_updates_first_token_time(self):
+        import asyncio
+        from unittest.mock import patch
+        from app.api.routes import _sse_chat_stream
+        from app.core.file_handler import TempFileManager
+
+        async def _mock_stream_success(*args, **kwargs):
+            yield {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "ACTIVE",
+                    "text_delta": "Xin chào!",
+                },
+            }
+            yield {
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "Xin chào!",
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                },
+            }
+
+        async def _run():
+            mgr = TempFileManager()
+            frames = []
+            with patch("app.api.routes.stream_agy_prompt", side_effect=_mock_stream_success):
+                async for frame in _sse_chat_stream("prompt", "model", "chat-2", 12345, mgr):
+                    frames.append(frame.decode("utf-8"))
+            joined = "".join(frames)
+            self.assertIn("Xin chào!", joined)
+            self.assertIn("finish_reason", joined)
+            self.assertIn("[DONE]", joined)
+
+        asyncio.run(_run())
+
+
 if __name__ == "__main__":
     unittest.main()

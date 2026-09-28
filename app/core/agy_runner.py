@@ -182,6 +182,7 @@ async def stream_agy_prompt(
     process = None
     stderr_task = None
     stopped_early = False
+    t0 = time.time()
     try:
         process = await asyncio.create_subprocess_exec(
             *inv.cmd,
@@ -218,6 +219,7 @@ async def stream_agy_prompt(
         await process.wait()
         stderr = await stderr_task
         if stopped_early:
+            record_runner_execution(model or "default", "stream-json", "success", time.time() - t0)
             return
         if process.returncode != 0:
             error_msg = stderr.decode().strip()

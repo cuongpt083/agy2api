@@ -24,6 +24,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(
         None, description="auto | none | required | {type:function, function:{name}}"
     )
+    max_tokens: Optional[int] = Field(None, description="The maximum number of tokens to generate.")
+    max_completion_tokens: Optional[int] = Field(None, description="Alternative to max_tokens for reasoning models.")
 
     model_config = {
         "extra": "ignore",

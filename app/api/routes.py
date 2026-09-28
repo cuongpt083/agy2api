@@ -142,6 +142,7 @@ def build_chat_prompt(req: ChatCompletionRequest, file_mgr: TempFileManager) -> 
             prompt_lines.append(f"Tool Result ({tool_label}): {content_text}")
         # 3. Standard messages (user, system, assistant plain text)
         elif content_text:
+            role_name = msg.role.capitalize()
             prompt_lines.append(f"{role_name}: {content_text}")
 
     prompt_lines.append("Assistant: ")

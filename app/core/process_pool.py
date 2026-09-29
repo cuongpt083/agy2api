@@ -31,6 +31,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _STDOUT_LIMIT = 16 * 1024 * 1024
+# Discard warm workers older than this (stale OAuth/eligibility risk).
+_MAX_WORKER_AGE_S = float(os.environ.get("AGY_POOL_MAX_WORKER_AGE_SECONDS", "900"))
 FLAVOR_PLAIN = "plain"
 FLAVOR_TOOLS = "tools"
 
@@ -57,8 +59,21 @@ class WarmWorker:
     created_at: float
     init_event: dict
     flavor: str = FLAVOR_PLAIN
+    # Started at spawn so idle eligibility/diagnostics cannot fill the PIPE and stall agy.
+    stderr_task: Optional[asyncio.Task] = None
+    stderr_lines: Optional[list] = None
+
+    def stderr_tail(self, max_chars: int = 500) -> str:
+        lines = self.stderr_lines or []
+        return "\n".join(lines)[-max_chars:]
 
     async def close(self) -> None:
+        if self.stderr_task is not None and not self.stderr_task.done():
+            self.stderr_task.cancel()
+            try:
+                await self.stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             if self.process.returncode is None:
                 self.process.terminate()
@@ -71,6 +86,29 @@ class WarmWorker:
             logger.warning("Error terminating warm worker: %s", e)
         finally:
             shutil.rmtree(self.prompt_dir, ignore_errors=True)
+
+
+
+async def _drain_worker_stderr(process: asyncio.subprocess.Process, lines: list, max_lines: int = 200) -> None:
+    """Continuously read stderr so the OS pipe never fills while the worker is idle."""
+    if process.stderr is None:
+        return
+    try:
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            text_line = line.decode(errors="replace").rstrip()
+            if not text_line:
+                continue
+            lines.append(text_line)
+            if len(lines) > max_lines:
+                del lines[: len(lines) - max_lines]
+            logger.debug("AGY warm stderr: %s", text_line)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("AGY warm stderr drain ended: %s", e)
 
 
 class AgyProcessPool:
@@ -162,6 +200,8 @@ class AgyProcessPool:
                 return None
 
             init_event = json.loads(init_line.decode(errors="replace"))
+            stderr_lines: list[str] = []
+            stderr_task = asyncio.create_task(_drain_worker_stderr(proc, stderr_lines))
             worker = WarmWorker(
                 process=proc,
                 prompt_dir=prompt_dir,
@@ -169,6 +209,8 @@ class AgyProcessPool:
                 created_at=time.time(),
                 init_event=init_event,
                 flavor=flavor,
+                stderr_task=stderr_task,
+                stderr_lines=stderr_lines,
             )
             logger.info(
                 "Warm worker ready in %.2fs (pid: %d, model: %s, flavor: %s)",
@@ -267,12 +309,23 @@ class AgyProcessPool:
             if worker in self._active_workers:
                 self._active_workers.remove(worker)
 
-            if worker.process.returncode is not None or (time.time() - worker.created_at > 1800):
-                logger.warning("Pooled worker stale or died (%s), discarding", target_key)
+            age = time.time() - worker.created_at
+            if worker.process.returncode is not None or age > _MAX_WORKER_AGE_S:
+                logger.warning(
+                    "Pooled worker stale or died (%s age=%.1fs), discarding",
+                    target_key,
+                    age,
+                )
                 await worker.close()
                 asyncio.create_task(self._spawn_worker_safe(target_model, flavor))
                 return None
 
+            logger.info(
+                "Acquired warm worker %s pid=%s age=%.1fs",
+                target_key,
+                worker.process.pid,
+                age,
+            )
             asyncio.create_task(self._spawn_worker_safe(target_model, flavor))
             return worker
         except asyncio.QueueEmpty:

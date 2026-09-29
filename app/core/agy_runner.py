@@ -18,6 +18,14 @@ logger = logging.getLogger(__name__)
 # Feed it as one NDJSON user event on stdin instead of a prompt.txt + view_file turn.
 _STDOUT_LIMIT = 16 * 1024 * 1024
 _PRINT_TIMEOUT = "10m"
+# Per-turn wall clock (readline-level). Warm spawn intentionally has NO --print-timeout
+# so idle pooled workers are not killed by the CLI clock.
+_TURN_TIMEOUT_S = float(os.environ.get("AGY_TURN_TIMEOUT_SECONDS", "600"))
+
+
+class AgyTimeoutError(RuntimeError):
+    """Raised when agy emits no stdout until the turn deadline."""
+
 
 
 @dataclass
@@ -98,7 +106,7 @@ async def _write_user_event_and_close(process: asyncio.subprocess.Process, promp
         pass
 
 
-async def _drain_stderr(process: asyncio.subprocess.Process) -> bytes:
+async def _drain_stderr(process: asyncio.subprocess.Process, collect: bool = True) -> bytes:
     if process.stderr is None:
         return b""
     chunks = []
@@ -106,29 +114,59 @@ async def _drain_stderr(process: asyncio.subprocess.Process) -> bytes:
         line = await process.stderr.readline()
         if not line:
             break
-        chunks.append(line)
-        text = line.decode(errors="replace").rstrip()
-        if text:
-            logger.debug("AGY stderr: %s", text)
-    return b"".join(chunks)
+        if collect:
+            chunks.append(line)
+        text_line = line.decode(errors="replace").rstrip()
+        if text_line:
+            logger.debug("AGY stderr: %s", text_line)
+    return b"".join(chunks) if collect else b""
 
 
-async def _iter_stdout_events(process: asyncio.subprocess.Process, stop_after_first_schema_object: bool = False):
+async def _iter_stdout_events(
+    process: asyncio.subprocess.Process,
+    stop_after_first_schema_object: bool = False,
+    deadline: float | None = None,
+    seen_events: list | None = None,
+):
     from app.core.tool_emulation import first_json_object
 
     accumulated = ""
+    loop = asyncio.get_running_loop()
     while True:
-        line = await process.stdout.readline()
+        if deadline is not None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise AgyTimeoutError(
+                    f"agy turn timed out after {_TURN_TIMEOUT_S:.0f}s; "
+                    f"events_seen={seen_events or []} pid={process.pid}"
+                )
+            try:
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise AgyTimeoutError(
+                    f"agy turn timed out after {_TURN_TIMEOUT_S:.0f}s; "
+                    f"events_seen={seen_events or []} pid={process.pid}"
+                ) from exc
+        else:
+            line = await process.stdout.readline()
         if not line:
             break
-        text = line.decode(errors="replace").strip()
-        if not text:
+        text_line = line.decode(errors="replace").strip()
+        if not text_line:
             continue
         try:
-            event = json.loads(text)
+            event = json.loads(text_line)
         except json.JSONDecodeError:
-            logger.warning("Skipping non-JSON AGY stream line: %s", text[:200])
+            logger.warning("Skipping non-JSON AGY stream line: %s", text_line[:200])
             continue
+        if seen_events is not None:
+            seen_events.append(event.get("event") or "?")
+        logger.info(
+            "AGY event=%s step_type=%s pid=%s",
+            event.get("event"),
+            (event.get("step_update") or {}).get("step_type"),
+            process.pid,
+        )
         yield event
         if stop_after_first_schema_object:
             step = event.get("step_update") or {}
@@ -149,25 +187,49 @@ async def stream_agy_prompt_pooled(
     """Execute a single turn on a pre-warmed agy process using stdin stream-json."""
     t0 = time.time()
     proc = worker.process
-    stderr_task = asyncio.create_task(_drain_stderr(proc))
+    # stderr is already drained continuously by the pool from spawn time.
+    seen_events: list[str] = []
+    deadline = asyncio.get_running_loop().time() + _TURN_TIMEOUT_S
+    logger.info(
+        "Warm turn start pid=%s model=%s age=%.1fs timeout=%.0fs",
+        proc.pid,
+        model,
+        time.time() - worker.created_at,
+        _TURN_TIMEOUT_S,
+    )
 
     try:
         await _write_user_event_and_close(proc, prompt)
-        async for event in _iter_stdout_events(proc, stop_after_first_schema_object):
+        async for event in _iter_stdout_events(
+            proc,
+            stop_after_first_schema_object=stop_after_first_schema_object,
+            deadline=deadline,
+            seen_events=seen_events,
+        ):
             yield event
         record_runner_execution(model or "default", "stream-json-warm", "success", time.time() - t0)
-    except Exception:
+        logger.info(
+            "Warm turn success pid=%s events=%s elapsed=%.2fs",
+            proc.pid,
+            seen_events,
+            time.time() - t0,
+        )
+    except Exception as exc:
+        stderr_tail = worker.stderr_tail()
+        logger.error(
+            "Warm turn failed pid=%s events=%s err=%s stderr_tail=%s",
+            proc.pid,
+            seen_events,
+            exc,
+            stderr_tail,
+        )
         record_runner_execution(model or "default", "stream-json-warm", "error", time.time() - t0)
+        if isinstance(exc, AgyTimeoutError) and stderr_tail:
+            raise AgyTimeoutError(f"{exc}; stderr_tail={stderr_tail}") from exc
         raise
     finally:
         # Single-use warm worker: always terminate after turn to guarantee 100% context isolation
         await worker.close()
-        if stderr_task and not stderr_task.done():
-            stderr_task.cancel()
-            try:
-                await stderr_task
-            except asyncio.CancelledError:
-                pass
 
 
 async def run_agy_prompt(
@@ -214,7 +276,9 @@ async def run_agy_prompt(
         await _write_user_event_and_close(process, prompt)
 
         final_result = None
-        async for event in _iter_stdout_events(process):
+        seen_events: list[str] = []
+        deadline = asyncio.get_running_loop().time() + _TURN_TIMEOUT_S
+        async for event in _iter_stdout_events(process, deadline=deadline, seen_events=seen_events):
             if event.get("event") == "result":
                 final_result = event.get("result")
 
@@ -286,7 +350,14 @@ async def stream_agy_prompt(
         await _write_user_event_and_close(process, prompt)
 
         saw_result = False
-        async for event in _iter_stdout_events(process, stop_after_first_schema_object):
+        seen_events: list[str] = []
+        deadline = asyncio.get_running_loop().time() + _TURN_TIMEOUT_S
+        async for event in _iter_stdout_events(
+            process,
+            stop_after_first_schema_object=stop_after_first_schema_object,
+            deadline=deadline,
+            seen_events=seen_events,
+        ):
             yield event
             if event.get("event") == "result":
                 saw_result = True

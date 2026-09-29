@@ -150,10 +150,10 @@ To enable the safety gate in your local `agy` environment, link or copy `hooks.j
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `AGY_API_KEY` | *(required)* | Secret API key for authenticating incoming requests |
-| `AGY_POOL_SIZE` | `1` | Number of warm standby worker processes per model. Set to `0` to disable pool |
+| `AGY_POOL_SIZE` | `1` (code) / `2` (`.env.example`) | Warm workers **per model/flavor** (`plain` + `tools`). `0` disables the pool. Use ≥2 for concurrent OpenClaw calls |
 | `AGY_DEFAULT_MODEL` | `gemini-3.8-flash-high` | Default model pre-warmed at startup if `AGY_POOL_MODELS` is not set |
-| `AGY_POOL_MODELS` | `gemini-3.8-flash-high` | Comma-separated list of models to pre-warm on server startup |
-| `AGY_POOL_MAX_DYNAMIC_MODELS` | `3` | Maximum number of model pools kept warm simultaneously before LRU eviction |
+| `AGY_POOL_MODELS` | `gemini-3.8-flash-high,gemini-3.8-flash-medium` | Comma-separated model ids to pre-warm. Include the ids the client actually sends |
+| `AGY_POOL_MAX_DYNAMIC_MODELS` | `6` | Max **model\|\|flavor** keys kept warm (plain + tools ≈ 3 models) before LRU eviction |
 
 ## 🔌 API Endpoints
 - `GET /health`

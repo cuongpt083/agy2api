@@ -253,6 +253,76 @@ class TestStreamErrorHandling(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_stream_emits_role_chunk_first(self):
+        import asyncio
+        from unittest.mock import patch
+        from app.api.routes import _sse_chat_stream
+        from app.core.file_handler import TempFileManager
+
+        async def _mock_stream_success(*args, **kwargs):
+            yield {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "ACTIVE",
+                    "text_delta": "Xin chào!",
+                },
+            }
+            yield {
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "Xin chào!",
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                },
+            }
+
+        async def _run():
+            mgr = TempFileManager()
+            frames = []
+            with patch("app.api.routes.stream_agy_prompt", side_effect=_mock_stream_success):
+                async for frame in _sse_chat_stream("prompt", "model", "chat-2", 12345, mgr):
+                    frames.append(frame.decode("utf-8"))
+            self.assertTrue(frames, "expected SSE frames")
+            self.assertIn('"role": "assistant"', frames[0])
+            self.assertNotIn('"content"', frames[0])
+            joined = "".join(frames)
+            self.assertIn("Xin chào!", joined)
+            self.assertIn("[DONE]", joined)
+
+        asyncio.run(_run())
+
+    def test_emulate_tools_still_emits_role_first(self):
+        import asyncio
+        from unittest.mock import patch
+        from app.api.routes import _sse_chat_stream
+        from app.core.file_handler import TempFileManager
+
+        async def _mock_stream_tool(*args, **kwargs):
+            yield {
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": '{"kind":"tool_call","name":"get_weather","arguments":{"city":"Hanoi"}}',
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                },
+            }
+
+        async def _run():
+            mgr = TempFileManager()
+            frames = []
+            with patch("app.api.routes.stream_agy_prompt", side_effect=_mock_stream_tool):
+                async for frame in _sse_chat_stream(
+                    "prompt", "model", "chat-3", 12345, mgr, emulate_tools=True
+                ):
+                    frames.append(frame.decode("utf-8"))
+            self.assertIn('"role": "assistant"', frames[0])
+            joined = "".join(frames)
+            self.assertIn('"finish_reason": "tool_calls"', joined)
+            self.assertIn("get_weather", joined)
+
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

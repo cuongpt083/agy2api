@@ -80,6 +80,16 @@ def format_sse(payload: Any) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+def sse_role_open(chat_id: str, created: int, model: str) -> bytes:
+    """First data chunk: role only. Resets openai-completions first-event watchdogs."""
+    return format_sse(openai_chunk(chat_id, created, model, {"role": "assistant"}))
+
+
+def sse_keepalive(chat_id: str, created: int, model: str) -> bytes:
+    """Periodic empty-delta chunk so idle clients do not time out while agy plans."""
+    return format_sse(openai_chunk(chat_id, created, model, {}))
+
+
 def events_to_sse_bytes(events: list[dict], chat_id: str, created: int, model: str):
     """Pure mapping used by the route and unit tests."""
     sent = ""

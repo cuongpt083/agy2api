@@ -10,6 +10,9 @@ Architecture: Take-and-Replenish (Single-Use Warm Spare) + Dynamic Auto-Warm
   while an async background task automatically pre-warms a worker for that model for future calls.
 - Least-Recently-Used (LRU) Eviction: Bounded memory footprint by evicting idle model pools
   when exceeding AGY_POOL_MAX_DYNAMIC_MODELS.
+- Flavors: each model is warmed twice — `plain` (no schema) and `tools` (`--json-schema`
+  TOOLS_JSON_SCHEMA). OpenClaw always sends tools, so without a tools flavor every request
+  would miss the pool.
 """
 
 from __future__ import annotations
@@ -22,15 +25,28 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_STDOUT_LIMIT = 16 * 1024 * 1024
+FLAVOR_PLAIN = "plain"
+FLAVOR_TOOLS = "tools"
 
 
 def _agy_env() -> dict[str, str]:
     env = os.environ.copy()
     env["AGY_IS_API_CALL"] = "1"
     return env
+
+
+def pool_key(model: Optional[str], flavor: str) -> str:
+    return f"{model or 'default'}||{flavor}"
+
+
+def flavor_for_schema(json_schema) -> str:
+    return FLAVOR_TOOLS if json_schema is not None else FLAVOR_PLAIN
 
 
 @dataclass
@@ -40,6 +56,7 @@ class WarmWorker:
     model: Optional[str]
     created_at: float
     init_event: dict
+    flavor: str = FLAVOR_PLAIN
 
     async def close(self) -> None:
         try:
@@ -57,13 +74,13 @@ class WarmWorker:
 
 
 class AgyProcessPool:
-    """Manages a pool of pre-warmed agy worker processes keyed by model."""
+    """Manages a pool of pre-warmed agy worker processes keyed by model||flavor."""
 
     def __init__(self, target_size: int = 1, default_model: Optional[str] = None):
         self.target_size = int(os.environ.get("AGY_POOL_SIZE", str(target_size)))
-        self.max_dynamic_models = int(os.environ.get("AGY_POOL_MAX_DYNAMIC_MODELS", "3"))
+        # Counted in model||flavor keys (plain + tools). Default 6 ≈ 3 models.
+        self.max_dynamic_models = int(os.environ.get("AGY_POOL_MAX_DYNAMIC_MODELS", "6"))
 
-        # Read configured models to pre-warm on startup
         env_models = os.environ.get("AGY_POOL_MODELS")
         if env_models:
             self.warm_models: list[str] = [m.strip() for m in env_models.split(",") if m.strip()]
@@ -77,24 +94,34 @@ class AgyProcessPool:
         self._active_workers: list[WarmWorker] = []
         self._auto_warm_in_progress: set[str] = set()
 
+    def _primary_keys(self) -> set[str]:
+        if not self.warm_models:
+            return set()
+        m = self.warm_models[0]
+        return {pool_key(m, FLAVOR_PLAIN), pool_key(m, FLAVOR_TOOLS)}
+
     async def start(self) -> None:
         """Start pre-warming workers in the background."""
         if self._running or self.target_size <= 0:
             return
         self._running = True
         logger.info(
-            "Starting AgyProcessPool (target size: %d per model, initial models: %s, max dynamic: %d)",
+            "Starting AgyProcessPool (target size: %d per model/flavor, initial models: %s, max dynamic keys: %d)",
             self.target_size,
             self.warm_models,
             self.max_dynamic_models,
         )
         for m in self.warm_models:
-            self._pools[m] = asyncio.Queue()
-            self._last_used[m] = time.time()
-            for _ in range(self.target_size):
-                asyncio.create_task(self._spawn_worker_safe(m))
+            for flavor in (FLAVOR_PLAIN, FLAVOR_TOOLS):
+                key = pool_key(m, flavor)
+                self._pools[key] = asyncio.Queue()
+                self._last_used[key] = time.time()
+                for _ in range(self.target_size):
+                    asyncio.create_task(self._spawn_worker_safe(m, flavor))
 
-    async def _spawn_one_worker(self, model: Optional[str] = None) -> Optional[WarmWorker]:
+    async def _spawn_one_worker(
+        self, model: Optional[str] = None, flavor: str = FLAVOR_PLAIN
+    ) -> Optional[WarmWorker]:
         prompt_dir = tempfile.mkdtemp(prefix="agy-pool-worker-")
         cmd = [
             "agy",
@@ -103,6 +130,11 @@ class AgyProcessPool:
             "--dangerously-skip-permissions",
             "--add-dir", prompt_dir,
         ]
+        if flavor == FLAVOR_TOOLS:
+            from app.core.tool_emulation import TOOLS_JSON_SCHEMA
+            schema_path = str(Path(prompt_dir) / "schema.json")
+            Path(schema_path).write_text(json.dumps(TOOLS_JSON_SCHEMA), encoding="utf-8")
+            cmd.extend(["--json-schema", schema_path])
         if model and model != "default":
             cmd.extend(["--model", model])
 
@@ -115,13 +147,16 @@ class AgyProcessPool:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_agy_env(),
+                limit=_STDOUT_LIMIT,
             )
 
-            # Read initial init event to verify readiness
             init_line = await proc.stdout.readline()
             if not init_line:
                 stderr = await proc.stderr.read()
-                logger.error("Warm worker failed to emit init event. Stderr: %s", stderr.decode(errors="replace")[:300])
+                logger.error(
+                    "Warm worker failed to emit init event. Stderr: %s",
+                    stderr.decode(errors="replace")[:300],
+                )
                 proc.kill()
                 shutil.rmtree(prompt_dir, ignore_errors=True)
                 return None
@@ -133,44 +168,51 @@ class AgyProcessPool:
                 model=model,
                 created_at=time.time(),
                 init_event=init_event,
+                flavor=flavor,
             )
-            logger.info("Warm worker ready in %.2fs (pid: %d, model: %s)", time.time() - t0, proc.pid, model)
+            logger.info(
+                "Warm worker ready in %.2fs (pid: %d, model: %s, flavor: %s)",
+                time.time() - t0,
+                proc.pid,
+                model,
+                flavor,
+            )
             return worker
         except Exception as e:
             logger.error("Failed to spawn warm agy worker: %s", e)
             shutil.rmtree(prompt_dir, ignore_errors=True)
             return None
 
-    async def _spawn_worker_safe(self, model: str) -> None:
+    async def _spawn_worker_safe(self, model: str, flavor: str = FLAVOR_PLAIN) -> None:
         if not self._running:
             return
-        worker = await self._spawn_one_worker(model)
+        key = pool_key(model, flavor)
+        worker = await self._spawn_one_worker(model, flavor)
         if worker:
             self._active_workers.append(worker)
-            if model not in self._pools:
-                self._pools[model] = asyncio.Queue()
-            await self._pools[model].put(worker)
+            if key not in self._pools:
+                self._pools[key] = asyncio.Queue()
+            await self._pools[key].put(worker)
         else:
             await asyncio.sleep(5.0)
-            if self._running and model in self._pools and self._pools[model].qsize() < self.target_size:
-                asyncio.create_task(self._spawn_worker_safe(model))
+            if self._running and key in self._pools and self._pools[key].qsize() < self.target_size:
+                asyncio.create_task(self._spawn_worker_safe(model, flavor))
 
-    async def _evict_lru_model_if_needed(self, incoming_model: str) -> None:
-        """Evicts the least-recently-used model queue if dynamic pool limit is reached."""
-        if incoming_model in self._pools or len(self._pools) < self.max_dynamic_models:
+    async def _evict_lru_model_if_needed(self, incoming_key: str) -> None:
+        """Evicts the least-recently-used pool key if the dynamic limit is reached."""
+        if incoming_key in self._pools or len(self._pools) < self.max_dynamic_models:
             return
 
-        # Find least recently used model (excluding default primary model if possible)
-        primary_model = self.warm_models[0] if self.warm_models else None
-        candidates = [m for m in self._pools if m != primary_model] or list(self._pools.keys())
+        protected = self._primary_keys()
+        candidates = [k for k in self._pools if k not in protected] or list(self._pools.keys())
         if not candidates:
             return
 
-        lru_model = min(candidates, key=lambda m: self._last_used.get(m, 0.0))
-        logger.info("Evicting LRU warm model pool: %s to accommodate %s", lru_model, incoming_model)
+        lru_key = min(candidates, key=lambda k: self._last_used.get(k, 0.0))
+        logger.info("Evicting LRU warm pool: %s to accommodate %s", lru_key, incoming_key)
 
-        q = self._pools.pop(lru_model, None)
-        self._last_used.pop(lru_model, None)
+        q = self._pools.pop(lru_key, None)
+        self._last_used.pop(lru_key, None)
         if q:
             while not q.empty():
                 try:
@@ -181,35 +223,38 @@ class AgyProcessPool:
                 except Exception:
                     pass
 
-    async def auto_warm_model(self, model: str) -> None:
-        """Dynamically registers and warms a new model when requested by users."""
+    async def auto_warm_model(self, model: str, flavor: str = FLAVOR_PLAIN) -> None:
+        """Dynamically registers and warms a new model/flavor when requested."""
         if not self._running or self.target_size <= 0 or not model:
             return
-        if model in self._pools or model in self._auto_warm_in_progress:
+        key = pool_key(model, flavor)
+        if key in self._pools or key in self._auto_warm_in_progress:
             return
 
-        self._auto_warm_in_progress.add(model)
+        self._auto_warm_in_progress.add(key)
         try:
-            await self._evict_lru_model_if_needed(model)
-            self._pools[model] = asyncio.Queue()
-            self._last_used[model] = time.time()
-            logger.info("Auto-warming pool for newly requested model: %s", model)
+            await self._evict_lru_model_if_needed(key)
+            self._pools[key] = asyncio.Queue()
+            self._last_used[key] = time.time()
+            logger.info("Auto-warming pool for %s", key)
             for _ in range(self.target_size):
-                asyncio.create_task(self._spawn_worker_safe(model))
+                asyncio.create_task(self._spawn_worker_safe(model, flavor))
         finally:
-            self._auto_warm_in_progress.discard(model)
+            self._auto_warm_in_progress.discard(key)
 
-    async def acquire(self, model: Optional[str] = None) -> Optional[WarmWorker]:
-        """Get a warm worker matching the exact model requested, else trigger auto-warm and return None."""
+    async def acquire(
+        self, model: Optional[str] = None, json_schema=None
+    ) -> Optional[WarmWorker]:
+        """Get a warm worker matching model + schema flavor, else trigger auto-warm and return None."""
         if not self._running or self.target_size <= 0:
             return None
 
-        # Resolve model key
-        target_key = model or (self.warm_models[0] if self.warm_models else "gemini-3.8-flash-high")
+        flavor = flavor_for_schema(json_schema)
+        target_model = model or (self.warm_models[0] if self.warm_models else "gemini-3.8-flash-high")
+        target_key = pool_key(target_model, flavor)
 
-        # If model is not yet in our warm pools, trigger dynamic auto-warm for subsequent requests
         if target_key not in self._pools:
-            asyncio.create_task(self.auto_warm_model(target_key))
+            asyncio.create_task(self.auto_warm_model(target_model, flavor))
             return None
 
         q = self._pools[target_key]
@@ -222,15 +267,13 @@ class AgyProcessPool:
             if worker in self._active_workers:
                 self._active_workers.remove(worker)
 
-            # Check if process is still alive and not stale (> 30 mins)
             if worker.process.returncode is not None or (time.time() - worker.created_at > 1800):
-                logger.warning("Pooled worker stale or died (model: %s), discarding", target_key)
+                logger.warning("Pooled worker stale or died (%s), discarding", target_key)
                 await worker.close()
-                asyncio.create_task(self._spawn_worker_safe(target_key))
+                asyncio.create_task(self._spawn_worker_safe(target_model, flavor))
                 return None
 
-            # Asynchronously spawn replacement immediately
-            asyncio.create_task(self._spawn_worker_safe(target_key))
+            asyncio.create_task(self._spawn_worker_safe(target_model, flavor))
             return worker
         except asyncio.QueueEmpty:
             return None
@@ -253,5 +296,4 @@ class AgyProcessPool:
         self._last_used.clear()
 
 
-# Global pool singleton
 global_pool = AgyProcessPool()

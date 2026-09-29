@@ -27,6 +27,8 @@ from app.core.openai_sse import (
     format_sse,
     next_text_delta,
     openai_chunk,
+    sse_keepalive,
+    sse_role_open,
     usage_from_agy,
 )
 from app.core.tool_emulation import (
@@ -157,6 +159,25 @@ def _assistant_text(agy_response) -> str:
     return str(agy_response)
 
 
+_KEEPALIVE_SECONDS = 15.0
+_QUEUE_END = object()
+
+
+async def _pump_agy_events(agen, queue: asyncio.Queue) -> None:
+    """Push agy events onto a queue so the SSE loop can emit keepalives without cancelling the generator."""
+    try:
+        async for event in agen:
+            await queue.put(event)
+    except Exception as exc:
+        await queue.put(exc)
+    finally:
+        try:
+            await agen.aclose()
+        except Exception:
+            pass
+        await queue.put(_QUEUE_END)
+
+
 async def _sse_chat_stream(
     prompt: str,
     model: str,
@@ -174,14 +195,38 @@ async def _sse_chat_stream(
     first_token_time = None
     captured_frames: list[bytes] = []
     conv_id = None
+    pump_task = None
     try:
+        # Immediate data chunk: OpenClaw/openai-completions times out waiting for first event
+        # while agy plans or reads files. Role-only delta is valid and not shown as content.
+        role_frame = sse_role_open(chat_id, created, model)
+        captured_frames.append(role_frame)
+        role_sent = True
+        first_token_time = 0.0
+        yield role_frame
+
         agen = stream_agy_prompt(
             prompt=prompt,
             model=model,
             json_schema=TOOLS_JSON_SCHEMA if emulate_tools else None,
             stop_after_first_schema_object=emulate_tools,
         )
-        async for event in agen:
+        queue: asyncio.Queue = asyncio.Queue()
+        pump_task = asyncio.create_task(_pump_agy_events(agen, queue))
+
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_SECONDS)
+            except asyncio.TimeoutError:
+                yield sse_keepalive(chat_id, created, model)
+                continue
+
+            if item is _QUEUE_END:
+                break
+            if isinstance(item, Exception):
+                raise item
+            event = item
+
             if event.get("event") == "init":
                 conv_id = event.get("conversation_id") or (
                     (event.get("init") or {}).get("conversation_id")
@@ -197,12 +242,9 @@ async def _sse_chat_stream(
             piece, sent = extract_agent_text_delta(event, sent)
             if piece:
                 now = time.time()
-                if first_token_time is None:
+                if first_token_time in (None, 0.0):
                     first_token_time = now - t0
                 delta = {"content": piece}
-                if not role_sent:
-                    delta["role"] = "assistant"
-                    role_sent = True
                 frame = format_sse(openai_chunk(chat_id, created, model, delta))
                 captured_frames.append(frame)
                 yield frame
@@ -212,10 +254,10 @@ async def _sse_chat_stream(
             final_text = result.get("response") or result.get("text") or ""
             piece, sent = next_text_delta(final_text, sent)
             if piece:
+                now = time.time()
+                if first_token_time in (None, 0.0):
+                    first_token_time = now - t0
                 delta = {"content": piece}
-                if not role_sent:
-                    delta["role"] = "assistant"
-                    role_sent = True
                 frame = format_sse(openai_chunk(chat_id, created, model, delta))
                 captured_frames.append(frame)
                 yield frame
@@ -282,6 +324,12 @@ async def _sse_chat_stream(
         yield format_sse(err)
         yield format_sse("[DONE]")
     finally:
+        if pump_task is not None and not pump_task.done():
+            pump_task.cancel()
+            try:
+                await pump_task
+            except (asyncio.CancelledError, Exception):
+                pass
         file_mgr.cleanup()
         if req_payload and captured_frames:
             try:

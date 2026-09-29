@@ -150,10 +150,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | Biến môi trường | Mặc định | Mô tả |
 | :--- | :--- | :--- |
 | `AGY_API_KEY` | *(bắt buộc)* | Khóa bí mật dùng để xác thực các yêu cầu API |
-| `AGY_POOL_SIZE` | `1` | Số lượng worker tiến trình warm dự phòng cho mỗi model. Đặt `0` để tắt pool |
+| `AGY_POOL_SIZE` | `1` (code) / `2` (`.env.example`) | Worker warm **mỗi model/flavor** (`plain` + `tools`). `0` tắt pool. ≥2 nếu client gọi song song |
 | `AGY_DEFAULT_MODEL` | `gemini-3.8-flash-high` | Model mặc định được khởi tạo sẵn khi khởi động nếu không đặt `AGY_POOL_MODELS` |
-| `AGY_POOL_MODELS` | `gemini-3.8-flash-high` | Danh sách model phân tách bằng dấu phẩy cần pre-warm khi server khởi động |
-| `AGY_POOL_MAX_DYNAMIC_MODELS` | `3` | Số lượng tối đa model pool được giữ đồng thời trong bộ nhớ trước khi thu hồi theo LRU |
+| `AGY_POOL_MODELS` | `gemini-3.8-flash-high,gemini-3.8-flash-medium` | Id model pre-warm, đúng id client gửi |
+| `AGY_POOL_MAX_DYNAMIC_MODELS` | `6` | Số khóa **model\|\|flavor** giữ ấm (plain + tools ≈ 3 model) trước khi LRU |
 
 ## 🔌 Các Endpoint Chính
 - `GET /health`

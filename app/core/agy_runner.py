@@ -74,6 +74,10 @@ def build_agy_invocation(
     return AgyInvocation(cmd=cmd, prompt_dir=prompt_dir, prompt=prompt, prompt_path=None)
 
 
+# Dump raw agy NDJSON events (truncated to 4KB each) when request tracing is on.
+_TRACE_EVENTS = os.environ.get("AGY_TRACE_REQUESTS", "").lower() in ("1", "true", "yes")
+
+
 def _agy_env() -> dict[str, str]:
     env = os.environ.copy()
     env["AGY_IS_API_CALL"] = "1"
@@ -167,6 +171,8 @@ async def _iter_stdout_events(
             (event.get("step_update") or {}).get("step_type"),
             process.pid,
         )
+        if _TRACE_EVENTS:
+            logger.info("AGY raw pid=%s %s", process.pid, text_line[:4000])
         yield event
         if stop_after_first_schema_object:
             step = event.get("step_update") or {}

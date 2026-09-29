@@ -15,6 +15,7 @@ __pycache__/
 
 # Logs
 *.log
+logs/
 
 # Docker
 .dockerignore
@@ -30,3 +31,4 @@ Thumbs.db
 
 # Local live-test artifacts
 tmp/
+data/*.db

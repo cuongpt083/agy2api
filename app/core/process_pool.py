@@ -289,6 +289,7 @@ class AgyProcessPool:
     ) -> Optional[WarmWorker]:
         """Get a warm worker matching model + schema flavor, else trigger auto-warm and return None."""
         if not self._running or self.target_size <= 0:
+            logger.info("Pool MISS reason=pool_disabled running=%s target_size=%s", self._running, self.target_size)
             return None
 
         flavor = flavor_for_schema(json_schema)
@@ -296,11 +297,19 @@ class AgyProcessPool:
         target_key = pool_key(target_model, flavor)
 
         if target_key not in self._pools:
+            logger.info(
+                "Pool MISS reason=no_pool key=%s requested_model=%r known_keys=%s",
+                target_key, model, sorted(self._pools.keys()),
+            )
             asyncio.create_task(self.auto_warm_model(target_model, flavor))
             return None
 
         q = self._pools[target_key]
         if q.empty():
+            logger.info(
+                "Pool MISS reason=empty_queue key=%s (worker still spawning or consumed by concurrent request)",
+                target_key,
+            )
             return None
 
         try:
@@ -329,6 +338,7 @@ class AgyProcessPool:
             asyncio.create_task(self._spawn_worker_safe(target_model, flavor))
             return worker
         except asyncio.QueueEmpty:
+            logger.info("Pool MISS reason=queue_race key=%s", target_key)
             return None
 
     async def shutdown(self) -> None:

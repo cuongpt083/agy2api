@@ -11,6 +11,10 @@ _CACHED_MODELS: List[Model] = []
 _LAST_FETCH_TIME: float = 0
 _CACHE_TTL_SECONDS: int = 3600  # Refresh cache every 1 hour
 _LOCK = asyncio.Lock()
+# After a failed `agy models` call, don't retry for this long (each attempt blocks up to 10s
+# and serializes behind _LOCK, making /v1/models take 10-20s under load).
+_FAIL_BACKOFF_SECONDS: int = 60
+_LAST_FAIL_TIME: float = 0
 
 # Safe fallback models if agy CLI fails or is unreachable
 FALLBACK_MODELS = [
@@ -89,7 +93,7 @@ async def get_available_models(force_refresh: bool = False) -> List[Model]:
     Returns available AI models with in-memory caching.
     Refreshes automatically when TTL expires.
     """
-    global _CACHED_MODELS, _LAST_FETCH_TIME
+    global _CACHED_MODELS, _LAST_FETCH_TIME, _LAST_FAIL_TIME
 
     now = time.time()
     if not force_refresh and _CACHED_MODELS and (now - _LAST_FETCH_TIME < _CACHE_TTL_SECONDS):
@@ -101,7 +105,12 @@ async def get_available_models(force_refresh: bool = False) -> List[Model]:
         if not force_refresh and _CACHED_MODELS and (now - _LAST_FETCH_TIME < _CACHE_TTL_SECONDS):
             return _CACHED_MODELS
 
+        if not force_refresh and _CACHED_MODELS and now - _LAST_FAIL_TIME < _FAIL_BACKOFF_SECONDS:
+            return _CACHED_MODELS
+
         models = await fetch_models_from_cli()
+        if not models:
+            _LAST_FAIL_TIME = time.time()
         if models:
             _CACHED_MODELS = models
             _LAST_FETCH_TIME = now

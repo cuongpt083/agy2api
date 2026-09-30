@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 _STDOUT_LIMIT = 16 * 1024 * 1024
 # Discard warm workers older than this (stale OAuth/eligibility risk).
 _MAX_WORKER_AGE_S = float(os.environ.get("AGY_POOL_MAX_WORKER_AGE_SECONDS", "900"))
+# How often the background sweeper replaces idle workers that exceeded max age.
+_SWEEP_INTERVAL_S = float(os.environ.get("AGY_POOL_SWEEP_INTERVAL_SECONDS", "60"))
+# Bound concurrent agy spawns so a burst does not starve CPU/RAM (cold start 3s -> 26s).
+_MAX_CONCURRENT_SPAWNS = int(os.environ.get("AGY_POOL_MAX_CONCURRENT_SPAWNS", "4"))
 FLAVOR_PLAIN = "plain"
 FLAVOR_TOOLS = "tools"
 
@@ -131,6 +135,8 @@ class AgyProcessPool:
         self._running = False
         self._active_workers: list[WarmWorker] = []
         self._auto_warm_in_progress: set[str] = set()
+        self._spawn_sem: Optional[asyncio.Semaphore] = None
+        self._sweeper_task: Optional[asyncio.Task] = None
 
     def _primary_keys(self) -> set[str]:
         if not self.warm_models:
@@ -143,6 +149,8 @@ class AgyProcessPool:
         if self._running or self.target_size <= 0:
             return
         self._running = True
+        self._spawn_sem = asyncio.Semaphore(max(1, _MAX_CONCURRENT_SPAWNS))
+        self._sweeper_task = asyncio.create_task(self._sweep_loop())
         logger.info(
             "Starting AgyProcessPool (target size: %d per model/flavor, initial models: %s, max dynamic keys: %d)",
             self.target_size,
@@ -150,7 +158,8 @@ class AgyProcessPool:
             self.max_dynamic_models,
         )
         for m in self.warm_models:
-            for flavor in (FLAVOR_PLAIN, FLAVOR_TOOLS):
+            # tools flavor first: OpenClaw-style clients always send tools.
+            for flavor in (FLAVOR_TOOLS, FLAVOR_PLAIN):
                 key = pool_key(m, flavor)
                 self._pools[key] = asyncio.Queue()
                 self._last_used[key] = time.time()
@@ -178,8 +187,9 @@ class AgyProcessPool:
 
         t0 = time.time()
         try:
+            from app.core.sandbox import wrap_cmd
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *wrap_cmd(cmd, prompt_dir),
                 cwd=prompt_dir,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -229,7 +239,14 @@ class AgyProcessPool:
         if not self._running:
             return
         key = pool_key(model, flavor)
-        worker = await self._spawn_one_worker(model, flavor)
+        if self._spawn_sem is not None:
+            async with self._spawn_sem:
+                worker = await self._spawn_one_worker(model, flavor)
+        else:
+            worker = await self._spawn_one_worker(model, flavor)
+        if worker and not self._running:
+            await worker.close()
+            return
         if worker:
             self._active_workers.append(worker)
             if key not in self._pools:
@@ -239,6 +256,43 @@ class AgyProcessPool:
             await asyncio.sleep(5.0)
             if self._running and key in self._pools and self._pools[key].qsize() < self.target_size:
                 asyncio.create_task(self._spawn_worker_safe(model, flavor))
+
+    async def _sweep_loop(self) -> None:
+        """Proactively replace idle workers older than max age so requests never hit a stale one."""
+        try:
+            while self._running:
+                await asyncio.sleep(_SWEEP_INTERVAL_S)
+                try:
+                    await self._sweep_once()
+                except Exception as e:
+                    logger.warning("Pool sweep failed: %s", e)
+        except asyncio.CancelledError:
+            pass
+
+    async def _sweep_once(self) -> None:
+        now = time.time()
+        for key, q in list(self._pools.items()):
+            fresh: list[WarmWorker] = []
+            stale = 0
+            while True:
+                try:
+                    w = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if w.process.returncode is not None or now - w.created_at > _MAX_WORKER_AGE_S:
+                    if w in self._active_workers:
+                        self._active_workers.remove(w)
+                    await w.close()
+                    stale += 1
+                else:
+                    fresh.append(w)
+            for w in fresh:
+                q.put_nowait(w)
+            if stale:
+                model, _, flavor = key.partition("||")
+                logger.info("Pool sweep: replaced %d stale worker(s) for %s", stale, key)
+                for _ in range(stale):
+                    asyncio.create_task(self._spawn_worker_safe(model, flavor))
 
     async def _evict_lru_model_if_needed(self, incoming_key: str) -> None:
         """Evicts the least-recently-used pool key if the dynamic limit is reached."""
@@ -313,21 +367,23 @@ class AgyProcessPool:
             return None
 
         try:
-            worker = q.get_nowait()
-            self._last_used[target_key] = time.time()
-            if worker in self._active_workers:
-                self._active_workers.remove(worker)
+            while True:
+                worker = q.get_nowait()
+                self._last_used[target_key] = time.time()
+                if worker in self._active_workers:
+                    self._active_workers.remove(worker)
 
-            age = time.time() - worker.created_at
-            if worker.process.returncode is not None or age > _MAX_WORKER_AGE_S:
-                logger.warning(
-                    "Pooled worker stale or died (%s age=%.1fs), discarding",
-                    target_key,
-                    age,
-                )
-                await worker.close()
-                asyncio.create_task(self._spawn_worker_safe(target_model, flavor))
-                return None
+                age = time.time() - worker.created_at
+                if worker.process.returncode is not None or age > _MAX_WORKER_AGE_S:
+                    logger.warning(
+                        "Pooled worker stale or died (%s age=%.1fs), discarding",
+                        target_key,
+                        age,
+                    )
+                    await worker.close()
+                    asyncio.create_task(self._spawn_worker_safe(target_model, flavor))
+                    continue  # try the next pooled worker before falling back to cold
+                break
 
             logger.info(
                 "Acquired warm worker %s pid=%s age=%.1fs",
@@ -344,6 +400,9 @@ class AgyProcessPool:
     async def shutdown(self) -> None:
         """Terminate all pooled processes and clean up."""
         self._running = False
+        if self._sweeper_task is not None:
+            self._sweeper_task.cancel()
+            self._sweeper_task = None
         logger.info("Shutting down AgyProcessPool...")
         for q in self._pools.values():
             while not q.empty():

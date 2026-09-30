@@ -3,6 +3,9 @@ import time
 import shutil
 import asyncio
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse

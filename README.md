@@ -150,6 +150,8 @@ To enable the safety gate in your local `agy` environment, link or copy `hooks.j
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `AGY_API_KEY` | *(required)* | Secret API key for authenticating incoming requests |
+| `CAPTURE_ENABLED` | `true` | Enable or disable capturing LLM turns to the background SQLite database (`true`/`false` or `1`/`0`) |
+| `CAPTURE_DB_PATH` | `data/capture.db` | Path to the SQLite capture database file |
 | `AGY_POOL_SIZE` | `1` (code) / `2` (`.env.example`) | Warm workers **per model/flavor** (`plain` + `tools`). `0` disables the pool. Use ≥2 for concurrent OpenClaw calls |
 | `AGY_DEFAULT_MODEL` | `gemini-3.8-flash-high` | Default model pre-warmed at startup if `AGY_POOL_MODELS` is not set |
 | `AGY_POOL_MODELS` | `gemini-3.8-flash-high,gemini-3.8-flash-medium` | Comma-separated model ids to pre-warm. Include the ids the client actually sends |

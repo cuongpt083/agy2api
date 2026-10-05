@@ -150,6 +150,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | Biến môi trường | Mặc định | Mô tả |
 | :--- | :--- | :--- |
 | `AGY_API_KEY` | *(bắt buộc)* | Khóa bí mật dùng để xác thực các yêu cầu API |
+| `CAPTURE_ENABLED` | `true` | Bật hoặc tắt việc capture các lượt hội thoại LLM ghi vào SQLite database (`true`/`false` hoặc `1`/`0`) |
+| `CAPTURE_DB_PATH` | `data/capture.db` | Đường dẫn file SQLite database lưu dữ liệu capture |
 | `AGY_POOL_SIZE` | `1` (code) / `2` (`.env.example`) | Worker warm **mỗi model/flavor** (`plain` + `tools`). `0` tắt pool. ≥2 nếu client gọi song song |
 | `AGY_DEFAULT_MODEL` | `gemini-3.8-flash-high` | Model mặc định được khởi tạo sẵn khi khởi động nếu không đặt `AGY_POOL_MODELS` |
 | `AGY_POOL_MODELS` | `gemini-3.8-flash-high,gemini-3.8-flash-medium` | Id model pre-warm, đúng id client gửi |

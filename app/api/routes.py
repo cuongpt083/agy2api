@@ -1,9 +1,11 @@
+import os
+import json
 import asyncio
 import time
 import uuid
 import io
 from typing import Optional
-from fastapi import APIRouter, Depends, BackgroundTasks, UploadFile, File, Form, Header
+from fastapi import Request, APIRouter, Depends, BackgroundTasks, UploadFile, File, Form, Header
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from app.api.models import (
     ChatCompletionRequest,
@@ -39,6 +41,7 @@ from app.core.tool_emulation import (
     to_openai_tool_calls,
 )
 import logging
+from app.core.logging_setup import trace_id_var
 import re
 from app.core.file_handler import TempFileManager
 from app.core.capcut_api import AsyncCapCutWrapper
@@ -95,62 +98,122 @@ def _ext_from_data_uri(url: str) -> str:
     return f".{mime_sub}"
 
 
+# agy truncates a stdin user message at roughly 190KB ("<truncated N bytes>"), and the tail is
+# what gets cut: the latest user request. OpenClaw-style clients send ~130KB system prompts plus
+# ~120KB of tool schemas, so the prompt must be fitted under this budget before it reaches agy.
+_MAX_PROMPT_BYTES = int(os.environ.get("AGY_MAX_PROMPT_BYTES", "170000"))
+# Per-message caps applied while fitting (head+tail kept, middle elided).
+_TAIL_MSG_CAP = 24_000
+_OLD_MSG_CAP = 4_000
+_MIN_SYSTEM_BYTES = 8_000
+
+
+def _nbytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _clip_middle(text: str, max_bytes: int) -> str:
+    if _nbytes(text) <= max_bytes:
+        return text
+    keep = max(max_bytes - 80, 200) // 2
+    raw = text.encode("utf-8")
+    head = raw[:keep].decode("utf-8", errors="ignore")
+    tail = raw[-keep:].decode("utf-8", errors="ignore")
+    return f"{head}\n[... {len(raw) - 2 * keep} bytes omitted by agy2api ...]\n{tail}"
+
+
+def _render_message(msg, file_mgr: TempFileManager, files_to_attach: list[str]) -> Optional[str]:
+    if msg.tool_calls or (msg.role or "").lower() == "tool":
+        return format_history_message(msg)
+    content_text = ""
+    if isinstance(msg.content, str):
+        content_text = msg.content
+    elif isinstance(msg.content, list):
+        text_parts = []
+        for p in msg.content:
+            if p.get("type") == "text":
+                text_parts.append(p.get("text", ""))
+            elif p.get("type") == "image_url":
+                url = p.get("image_url", {}).get("url", "")
+                if url.startswith("data:"):
+                    ext = _ext_from_data_uri(url)
+                    try:
+                        fpath = file_mgr.add_base64_file(url, ext=ext)
+                        files_to_attach.append(fpath)
+                        text_parts.append(f"[Attached Image: {fpath}]")
+                    except Exception as e:
+                        text_parts.append(f"[Failed to attach image: {e}]")
+                else:
+                    text_parts.append(f"[Image URL: {url}]")
+        content_text = " ".join(text_parts)
+    if content_text:
+        return f"{msg.role.capitalize()}: {content_text}"
+    return None
+
+
 def build_chat_prompt(req: ChatCompletionRequest, file_mgr: TempFileManager) -> tuple[str, list[str]]:
-    prompt_lines = []
-    files_to_attach = []
-
-    if req.tools:
-        prompt_lines.append(format_tools_preamble(req.tools, req.tool_choice).rstrip())
-
+    files_to_attach: list[str] = []
+    system_lines: list[str] = []
+    convo: list[str] = []
+    last_user_idx = -1
     for msg in req.messages:
-        if msg.tool_calls or (msg.role or "").lower() == "tool":
-            prompt_lines.append(format_history_message(msg))
+        line = _render_message(msg, file_mgr, files_to_attach)
+        if line is None:
             continue
-        if isinstance(msg.content, str):
-            content_text = msg.content
-        elif isinstance(msg.content, list):
-            text_parts = []
-            for p in msg.content:
-                if p.get("type") == "text":
-                    text_parts.append(p.get("text", ""))
-                elif p.get("type") == "image_url":
-                    url = p.get("image_url", {}).get("url", "")
-                    if url.startswith("data:"):
-                        ext = _ext_from_data_uri(url)
-                        try:
-                            fpath = file_mgr.add_base64_file(url, ext=ext)
-                            files_to_attach.append(fpath)
-                            text_parts.append(f"[Attached Image: {fpath}]")
-                        except Exception as e:
-                            text_parts.append(f"[Failed to attach image: {e}]")
-                    else:
-                        text_parts.append(f"[Image URL: {url}]")
-            content_text = " ".join(text_parts)
+        if (msg.role or "").lower() in ("system", "developer") and not convo:
+            system_lines.append(line)
+            continue
+        if (msg.role or "").lower() == "user":
+            last_user_idx = len(convo)
+        convo.append(line)
 
-        # 1. Assistant message with tool calls
-        if msg.role == "assistant" and getattr(msg, "tool_calls", None):
-            call_strs = []
-            for tc in msg.tool_calls:
-                fn = tc.get("function") or {}
-                fn_name = fn.get("name", "tool")
-                fn_args = fn.get("arguments", "")
-                call_strs.append(f"{fn_name}({fn_args})")
-            call_repr = f"[Tool Call: {'; '.join(call_strs)}]"
-            if content_text:
-                prompt_lines.append(f"Assistant: {content_text}\n{call_repr}")
-            else:
-                prompt_lines.append(f"Assistant: {call_repr}")
-        # 2. Tool output message
-        elif msg.role == "tool":
-            tool_label = getattr(msg, "name", None) or getattr(msg, "tool_call_id", None) or "output"
-            prompt_lines.append(f"Tool Result ({tool_label}): {content_text}")
-        # 3. Standard messages (user, system, assistant plain text)
-        elif content_text:
-            role_name = msg.role.capitalize()
-            prompt_lines.append(f"{role_name}: {content_text}")
+    preamble = format_tools_preamble(req.tools, req.tool_choice).rstrip() if req.tools else ""
+    system = "\n".join(system_lines)
+    closing = "Assistant: "
 
-    prompt_lines.append("Assistant: ")
-    return "\n".join(prompt_lines), files_to_attach
+    def assemble(pre: str, sys_text: str, history: list[str]) -> str:
+        parts = [x for x in (pre, sys_text) if x] + history + [closing]
+        return "\n".join(parts)
+
+    full = assemble(preamble, system, convo)
+    if _nbytes(full) <= _MAX_PROMPT_BYTES:
+        return full, files_to_attach
+
+    # 1. Slim tool schemas (drop per-field docs, clip long descriptions).
+    if req.tools:
+        preamble = format_tools_preamble(req.tools, req.tool_choice, slim=True).rstrip()
+
+    # 2. Latest user turn and everything after it is kept (each message capped).
+    split = last_user_idx if last_user_idx >= 0 else max(len(convo) - 1, 0)
+    tail = [_clip_middle(x, _TAIL_MSG_CAP) for x in convo[split:]]
+    older = convo[:split]
+
+    budget = _MAX_PROMPT_BYTES - _nbytes(preamble) - sum(_nbytes(x) + 1 for x in tail) - 200
+    # 3. System prompt gets what is left, but never so much that no history fits.
+    sys_budget = max(min(_nbytes(system), budget - min(budget // 4, 20_000)), _MIN_SYSTEM_BYTES)
+    system = _clip_middle(system, sys_budget) if system else ""
+    budget -= _nbytes(system)
+
+    # 4. Older history newest-first, each clipped, until the budget runs out.
+    kept: list[str] = []
+    for line in reversed(older):
+        line = _clip_middle(line, _OLD_MSG_CAP)
+        cost = _nbytes(line) + 1
+        if cost > budget:
+            break
+        kept.append(line)
+        budget -= cost
+    kept.reverse()
+    dropped = len(older) - len(kept)
+    if dropped:
+        kept.insert(0, f"[... {dropped} earlier conversation messages omitted by agy2api to fit the prompt limit ...]")
+
+    fitted = assemble(preamble, system, kept + tail)
+    logger.info(
+        "Prompt fitted to budget: %d -> %d bytes (limit %d, tools_slim=%s, older_dropped=%d)",
+        _nbytes(full), _nbytes(fitted), _MAX_PROMPT_BYTES, bool(req.tools), dropped,
+    )
+    return fitted, files_to_attach
 
 
 def _assistant_text(agy_response) -> str:
@@ -158,6 +221,49 @@ def _assistant_text(agy_response) -> str:
         return agy_response.get("text") or agy_response.get("content") or agy_response.get("response") or str(agy_response)
     return str(agy_response)
 
+
+# Set AGY_TRACE_REQUESTS=1 to dump each incoming chat request (headers + body) to
+# logs/trace/requests.jsonl, and log a one-line summary + pool key decision.
+TRACE_REQUESTS = os.environ.get("AGY_TRACE_REQUESTS", "").lower() in ("1", "true", "yes")
+_TRACE_FILE = os.environ.get("AGY_TRACE_FILE", os.path.join("logs", "trace", "requests.jsonl"))
+_SENSITIVE_HEADERS = {"authorization", "x-api-key", "cookie"}
+
+
+def _trace_request(request: Request, req: ChatCompletionRequest) -> None:
+    try:
+        headers = {
+            k: ("<redacted>" if k.lower() in _SENSITIVE_HEADERS else v)
+            for k, v in request.headers.items()
+        }
+        body = req.model_dump()
+        tools = req.tools or []
+        tool_names = [((t.get("function") or {}).get("name") or t.get("name")) for t in tools]
+        emulate = bool(req.tools) and req.tool_choice != "none"
+        logger.info(
+            "TRACE model=%r stream=%s n_tools=%d tool_choice=%r emulate_tools=%s -> pool_key=%s||%s "
+            "n_messages=%d roles=%s ua=%r",
+            req.model, req.stream, len(tools), req.tool_choice, emulate,
+            req.model, "tools" if emulate else "plain",
+            len(req.messages), [m.role for m in req.messages][:12], headers.get("user-agent"),
+        )
+        os.makedirs(os.path.dirname(_TRACE_FILE), exist_ok=True)
+        with open(_TRACE_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": time.time(), "trace_id": trace_id_var.get(None),
+                "client": request.client.host if request.client else None,
+                "headers": headers, "tool_names": tool_names, "body": body,
+            }, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        logger.warning("trace dump failed: %s", e)
+
+
+# aicoworker/OpenClaw's first-token watchdog (attempt.ts FIRST_TOKEN_STALL_TIMEOUT_MS=30s) is only
+# disarmed by a content-bearing event (text/thinking/toolcall delta). Role-only and empty-delta
+# keepalive chunks are ignored, so a tools turn that buffers >30s gets aborted and failed over to
+# the fallback model. Emit one non-empty reasoning_content delta up front (shown as "thinking",
+# never as assistant text) for tool-emulated streams. Set AGY_TOOLS_EARLY_THINKING=0 to disable.
+EARLY_THINKING = os.environ.get("AGY_TOOLS_EARLY_THINKING", "1").lower() not in ("0", "false", "no")
+_EARLY_THINKING_TEXT = "Working…"
 
 _KEEPALIVE_SECONDS = 15.0
 _QUEUE_END = object()
@@ -204,6 +310,12 @@ async def _sse_chat_stream(
         role_sent = True
         first_token_time = 0.0
         yield role_frame
+        if emulate_tools and EARLY_THINKING:
+            think_frame = format_sse(
+                openai_chunk(chat_id, created, model, {"reasoning_content": _EARLY_THINKING_TEXT})
+            )
+            captured_frames.append(think_frame)
+            yield think_frame
 
         agen = stream_agy_prompt(
             prompt=prompt,
@@ -347,12 +459,15 @@ async def _sse_chat_stream(
 
 @router.post("/chat/completions", summary="Chat Completions", description="Creates a model response for the given chat conversation. Supports multimodal inputs via base64 data URIs. Set stream=true for OpenAI-compatible SSE. Pass OpenAI `tools` to emulate function calling via agy --json-schema.")
 async def chat_completions(
+    request: Request,
     req: ChatCompletionRequest,
     background_tasks: BackgroundTasks,
     api_key: str = Depends(get_api_key),
     x_source_agent: Optional[str] = Header(default=None, alias="X-Source-Agent"),
 ):
     logger.info(f"Processing chat completions for model: {req.model} stream={req.stream} tools={bool(req.tools)}")
+    if TRACE_REQUESTS:
+        _trace_request(request, req)
     file_mgr = TempFileManager()
     final_prompt, files_to_attach = build_chat_prompt(req, file_mgr)
     emulate_tools = bool(req.tools) and req.tool_choice != "none"

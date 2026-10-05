@@ -15,14 +15,33 @@ import time
 import uuid
 from typing import Any, Optional
 
+from dotenv import load_dotenv
+
 from app.core.capture_db import CaptureDatabase
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+def _is_truthy(val: Optional[str], default: bool = True) -> bool:
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_capture_enabled() -> bool:
+    """Check whether capture to SQLite is enabled via environment variables."""
+    val = os.environ.get("CAPTURE_ENABLED")
+    if val is None:
+        val = os.environ.get("AGY_CAPTURE_ENABLED")
+    return _is_truthy(val, default=True)
+
+
 # Configurable parameters via environment variables
-CAPTURE_ENABLED = os.environ.get("CAPTURE_ENABLED", "true").lower() in ("1", "true", "yes")
+CAPTURE_ENABLED = is_capture_enabled()
 DEFAULT_DB_PATH = os.path.join(os.getcwd(), "data", "capture.db")
-CAPTURE_DB_PATH = os.environ.get("CAPTURE_DB_PATH", DEFAULT_DB_PATH)
+CAPTURE_DB_PATH = os.environ.get("CAPTURE_DB_PATH") or os.environ.get("AGY_CAPTURE_DB_PATH", DEFAULT_DB_PATH)
 CAPTURE_QUEUE_MAXSIZE = int(os.environ.get("CAPTURE_QUEUE_MAXSIZE", "2000"))
 CAPTURE_BATCH_SIZE = int(os.environ.get("CAPTURE_BATCH_SIZE", "50"))
 CAPTURE_BATCH_TIMEOUT = float(os.environ.get("CAPTURE_BATCH_TIMEOUT", "1.0"))
@@ -151,15 +170,15 @@ def extract_reasoning_from_text(content: str) -> tuple[Optional[str], str]:
 class CaptureManager:
     def __init__(
         self,
-        db_path: str = CAPTURE_DB_PATH,
-        enabled: bool = CAPTURE_ENABLED,
+        db_path: Optional[str] = None,
+        enabled: Optional[bool] = None,
         queue_maxsize: int = CAPTURE_QUEUE_MAXSIZE,
         batch_size: int = CAPTURE_BATCH_SIZE,
         batch_timeout: float = CAPTURE_BATCH_TIMEOUT,
         brain_dir: str = DEFAULT_BRAIN_DIR,
     ):
-        self.db_path = db_path
-        self.enabled = enabled
+        self.db_path = db_path if db_path is not None else CAPTURE_DB_PATH
+        self.enabled = is_capture_enabled() if enabled is None else enabled
         self.queue_maxsize = queue_maxsize
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout

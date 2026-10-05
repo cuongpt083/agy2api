@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import aiosqlite
@@ -12,6 +13,7 @@ from app.core.capture import (
     CaptureManager,
     extract_reasoning_from_text,
     extract_thinking_from_brain_async,
+    is_capture_enabled,
     parse_usage_and_reasoning_from_chunks,
 )
 
@@ -273,5 +275,67 @@ class TestCaptureManagerQueue(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("<think>\nFrance capital query. Answer is Paris directly.\n</think>", turn.get("content", ""))
 
 
+class TestCaptureToggle(unittest.IsolatedAsyncioTestCase):
+    def test_is_capture_enabled_parsing(self):
+        # Test truthy values
+        for val in ["true", "True", "1", "yes", "YES", "on"]:
+            with mock.patch.dict(os.environ, {"CAPTURE_ENABLED": val}, clear=False):
+                self.assertTrue(is_capture_enabled())
+
+        # Test falsy values
+        for val in ["false", "False", "0", "no", "NO", "off"]:
+            with mock.patch.dict(os.environ, {"CAPTURE_ENABLED": val}, clear=False):
+                self.assertFalse(is_capture_enabled())
+
+        # Test AGY_CAPTURE_ENABLED fallback
+        with mock.patch.dict(os.environ, {}, clear=False):
+            if "CAPTURE_ENABLED" in os.environ:
+                del os.environ["CAPTURE_ENABLED"]
+            os.environ["AGY_CAPTURE_ENABLED"] = "false"
+            self.assertFalse(is_capture_enabled())
+            os.environ["AGY_CAPTURE_ENABLED"] = "true"
+            self.assertTrue(is_capture_enabled())
+
+    async def test_manager_disabled_does_not_capture_or_connect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "disabled_test.db")
+            manager = CaptureManager(
+                db_path=db_path,
+                enabled=False,
+            )
+            self.assertFalse(manager.enabled)
+
+            # Starting a disabled manager should not start worker task or connect DB
+            await manager.start()
+            self.assertFalse(manager._running)
+            self.assertIsNone(manager.queue)
+            self.assertIsNone(manager._worker_task)
+            self.assertIsNone(manager.db._connection)
+
+            # Enqueueing should fail-open and return False immediately
+            result = manager.enqueue_turn(
+                request_payload={"model": "gemini-3.8-flash", "messages": [{"role": "user", "content": "hi"}]},
+                response_data={"choices": [{"message": {"content": "hello"}}]},
+                source_agent="test-agent",
+            )
+            self.assertFalse(result)
+
+            # Stop cleanly
+            await manager.stop()
+
+            # Ensure no DB file was created
+            self.assertFalse(os.path.exists(db_path))
+
+    async def test_manager_picks_up_env_var(self):
+        with mock.patch.dict(os.environ, {"CAPTURE_ENABLED": "false"}):
+            manager = CaptureManager()
+            self.assertFalse(manager.enabled)
+
+        with mock.patch.dict(os.environ, {"CAPTURE_ENABLED": "true"}):
+            manager = CaptureManager()
+            self.assertTrue(manager.enabled)
+
+
 if __name__ == "__main__":
     unittest.main()
+

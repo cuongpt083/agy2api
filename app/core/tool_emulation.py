@@ -105,10 +105,43 @@ def to_openai_tool_calls(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def format_tools_preamble(tools: list[dict[str, Any]] | None, tool_choice: Any = None) -> str:
+_SLIM_TOOL_DESC_CHARS = 600
+_SLIM_DROP_KEYS = ("description", "examples", "title")
+
+
+def _strip_schema_docs(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {k: _strip_schema_docs(v) for k, v in node.items() if k not in _SLIM_DROP_KEYS}
+    if isinstance(node, list):
+        return [_strip_schema_docs(v) for v in node]
+    return node
+
+
+def slim_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Name + clipped description + parameter schema without per-field docs."""
+    out = []
+    for t in tools:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(fn, dict):
+            out.append(t)
+            continue
+        desc = fn.get("description") or ""
+        if len(desc) > _SLIM_TOOL_DESC_CHARS:
+            desc = desc[:_SLIM_TOOL_DESC_CHARS] + "…"
+        slim = {"name": fn.get("name"), "description": desc}
+        if fn.get("parameters") is not None:
+            slim["parameters"] = _strip_schema_docs(fn["parameters"])
+        out.append({"type": "function", "function": slim})
+    return out
+
+
+def format_tools_preamble(
+    tools: list[dict[str, Any]] | None, tool_choice: Any = None, slim: bool = False
+) -> str:
     if not tools:
         return ""
-    lines = [_PREAMBLE, json.dumps(tools, ensure_ascii=False, indent=2)]
+    # Compact JSON: indent=2 inflated 41 OpenClaw tools from ~117KB to ~168KB.
+    lines = [_PREAMBLE, json.dumps(slim_tools(tools) if slim else tools, ensure_ascii=False, separators=(",", ":"))]
     if tool_choice == "none":
         lines.append('\ntool_choice is "none": do not call any client tool. Emit kind="message".')
     elif tool_choice in ("required", "any"):

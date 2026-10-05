@@ -11,6 +11,7 @@ from typing import Optional
 
 from app.core.metrics import record_runner_execution
 from app.core.process_pool import global_pool, WarmWorker
+from app.core.sandbox import wrap_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,15 @@ _PRINT_TIMEOUT = "10m"
 # Per-turn wall clock (readline-level). Warm spawn intentionally has NO --print-timeout
 # so idle pooled workers are not killed by the CLI clock.
 _TURN_TIMEOUT_S = float(os.environ.get("AGY_TURN_TIMEOUT_SECONDS", "600"))
+
+
+# Tools-emulation turns must only emit a JSON object. If agy's own agent starts running built-in
+# tools (run_command/view_file/...) it loops for 60-100s+ and the client times out; abort early.
+_MAX_BUILTIN_TOOL_STEPS = int(os.environ.get("AGY_MAX_BUILTIN_TOOL_STEPS", "3"))
+
+
+class AgyBuiltinToolLoopError(RuntimeError):
+    """Raised when agy runs too many built-in tool steps in a schema-only (tools emulation) turn."""
 
 
 class AgyTimeoutError(RuntimeError):
@@ -72,6 +82,10 @@ def build_agy_invocation(
     if model:
         cmd.extend(["--model", model])
     return AgyInvocation(cmd=cmd, prompt_dir=prompt_dir, prompt=prompt, prompt_path=None)
+
+
+# Dump raw agy NDJSON events (truncated to 4KB each) when request tracing is on.
+_TRACE_EVENTS = os.environ.get("AGY_TRACE_REQUESTS", "").lower() in ("1", "true", "yes")
 
 
 def _agy_env() -> dict[str, str]:
@@ -175,6 +189,7 @@ async def _iter_stdout_events(
     from app.core.tool_emulation import first_json_object
 
     accumulated = ""
+    builtin_tool_steps = 0
     loop = asyncio.get_running_loop()
     while True:
         if deadline is not None:
@@ -211,9 +226,18 @@ async def _iter_stdout_events(
             (event.get("step_update") or {}).get("step_type"),
             process.pid,
         )
+        if _TRACE_EVENTS:
+            logger.info("AGY raw pid=%s %s", process.pid, text_line[:4000])
         yield event
         if stop_after_first_schema_object:
             step = event.get("step_update") or {}
+            if step.get("step_type") == "tool" and step.get("state") == "ACTIVE":
+                builtin_tool_steps += 1
+                if _MAX_BUILTIN_TOOL_STEPS > 0 and builtin_tool_steps > _MAX_BUILTIN_TOOL_STEPS:
+                    raise AgyBuiltinToolLoopError(
+                        f"agy ran {builtin_tool_steps} built-in tool steps (last={step.get('tool_name')}) "
+                        f"in a schema-only turn; aborted pid={process.pid}"
+                    )
             if event.get("event") == "step_update" and step.get("step_type") == "agent_response":
                 accumulated += step.get("text_delta") or ""
                 if first_json_object(accumulated):
@@ -262,6 +286,12 @@ async def stream_agy_prompt_pooled(
             seen_events,
             time.time() - t0,
         )
+    except (asyncio.CancelledError, GeneratorExit):
+        logger.info(
+            "Warm turn aborted by client/consumer pid=%s events=%s elapsed=%.2fs",
+            proc.pid, seen_events, time.time() - t0,
+        )
+        raise
     except Exception as exc:
         stderr_tail = worker.stderr_tail()
         logger.error(
@@ -312,7 +342,7 @@ async def run_agy_prompt(
     stderr_task = None
     try:
         process = await asyncio.create_subprocess_exec(
-            *inv.cmd,
+            *wrap_cmd(inv.cmd, inv.prompt_dir, extra_dirs),
             cwd=inv.prompt_dir,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -408,7 +438,7 @@ async def stream_agy_prompt(
     t0 = time.time()
     try:
         process = await asyncio.create_subprocess_exec(
-            *inv.cmd,
+            *wrap_cmd(inv.cmd, inv.prompt_dir, extra_dirs),
             cwd=inv.prompt_dir,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -457,6 +487,10 @@ async def stream_agy_prompt(
             yield event
         if stop_after_first_schema_object and not saw_result:
             stopped_early = True
+            logger.info(
+                "AGY cold turn early-stop (schema object complete) pid=%s events=%d elapsed=%.2fs",
+                process.pid, len(seen_events), time.time() - t0,
+            )
             if process.returncode is None:
                 process.kill()
 
@@ -476,6 +510,10 @@ async def stream_agy_prompt(
             record_runner_execution(model or "default", "stream-json", "error", time.time() - t0)
             raise
         record_runner_execution(model or "default", "stream-json", "success", time.time() - t0)
+        logger.info("AGY cold turn done pid=%s events=%d elapsed=%.2fs", process.pid, len(seen_events), time.time() - t0)
+    except (asyncio.CancelledError, GeneratorExit):
+        logger.info("AGY cold turn aborted by client/consumer elapsed=%.2fs", time.time() - t0)
+        raise
     except Exception:
         record_runner_execution(model or "default", "stream-json", "error", time.time() - t0)
         raise

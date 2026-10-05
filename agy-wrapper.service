@@ -4,14 +4,16 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/truong/agy2api
-ExecStart=/home/truong/agy2api/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+WorkingDirectory=/home/cuongpt/agy2api
+ExecStart=/home/cuongpt/agy2api/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5
 
 # Environment variables
-EnvironmentFile=/home/truong/agy2api/.env
-Environment="PATH=/home/truong/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=/home/cuongpt/agy2api/.env
+Environment="PATH=/home/cuongpt/agy2api/.venv/bin:/home/cuongpt/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
+UnsetEnvironment=SSH_CLIENT SSH_CONNECTION SSH_TTY
 
 [Install]
 WantedBy=default.target

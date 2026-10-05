@@ -46,27 +46,43 @@ def stable_output_images(out_dir: str, n: int, previous_sizes: dict[str, int]) -
     return []
 
 
-def collect_generated_images(out_dir: str, agy_text: str, n: int) -> list[str]:
+def collect_generated_images(out_dir: str, agy_text: str, n: int, allowed_root: str | None = None) -> list[str]:
     n = max(n, 0)
     paths = _scan_out_dir(out_dir)
     if len(paths) >= n:
         return paths[:n]
 
     os.makedirs(out_dir, exist_ok=True)
-    seen = {os.path.normcase(os.path.abspath(p)) for p in paths}
+    seen = {os.path.normcase(os.path.realpath(p)) for p in paths}
+    workspace_root = os.path.normcase(os.path.realpath(allowed_root or Path(out_dir).parent))
+
     for match in _PATH_RE.findall(agy_text or ""):
-        src = os.path.abspath(match)
-        if not os.path.isfile(src) or Path(src).suffix.lower() not in IMAGE_EXTENSIONS:
+        # Use realpath to resolve symlinks and Windows junctions
+        try:
+            resolved_src = os.path.realpath(match)
+        except Exception:
             continue
-        key = os.path.normcase(src)
-        if key in seen:
+
+        if not os.path.isfile(resolved_src) or Path(resolved_src).suffix.lower() not in IMAGE_EXTENSIONS:
             continue
-        dest = os.path.join(out_dir, Path(src).name)
-        if os.path.abspath(src) != os.path.abspath(dest):
-            shutil.copy2(src, dest)
-            src = dest
-        paths.append(src)
-        seen.add(os.path.normcase(os.path.abspath(src)))
+
+        # Prevent arbitrary host file exfiltration: resolved file must reside strictly inside workspace
+        norm_src = os.path.normcase(resolved_src)
+        try:
+            if os.path.commonpath([workspace_root, norm_src]) != workspace_root:
+                continue
+        except ValueError:
+            # Different drive letters on Windows
+            continue
+
+        if norm_src in seen:
+            continue
+        dest = os.path.join(out_dir, Path(resolved_src).name)
+        if os.path.normcase(os.path.abspath(resolved_src)) != os.path.normcase(os.path.abspath(dest)):
+            shutil.copy2(resolved_src, dest)
+            resolved_src = dest
+        paths.append(resolved_src)
+        seen.add(norm_src)
         if len(paths) >= n:
             break
     return paths[:n]

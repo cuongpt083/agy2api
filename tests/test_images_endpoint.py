@@ -254,3 +254,92 @@ class TestImagesEndpointStream(unittest.TestCase):
         errors = [f for f in frames if isinstance(f, dict) and f.get("type") == "error"]
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["error"]["type"], "image_generation_error")
+
+    def test_concurrency_timeout_returns_429(self):
+        import httpx
+        from httpx import ASGITransport
+        import app.core.image_limiter as img_limiter
+
+        gate = asyncio.Event()
+
+        async def fake_slow_run(prompt, model=None, output_format="json", files=None, extra_dirs=None):
+            await gate.wait()
+            out = Path(extra_dirs[0]) / "out"
+            (out / "output-1.png").write_bytes(PNG_BYTES)
+            return {"response": "done"}
+
+        async def _run():
+            with (
+                patch.dict("os.environ", {"AGY_IMAGE_MAX_CONCURRENCY": "1", "AGY_IMAGE_QUEUE_TIMEOUT_S": "0.1"}),
+                patch("app.api.routes.run_agy_prompt", new=fake_slow_run),
+            ):
+                img_limiter.reset_limiter_state()
+                transport = ASGITransport(app=_app())
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    task1 = asyncio.create_task(
+                        client.post("/v1/images/generations", json={"prompt": "slow cat"})
+                    )
+                    # Yield control to let task1 acquire the semaphore slot
+                    await asyncio.sleep(0.02)
+
+                    # Second request should time out and receive 429
+                    res2 = await client.post("/v1/images/generations", json={"prompt": "queued cat"})
+
+                    # Unblock task1 so it can complete
+                    gate.set()
+                    res1 = await task1
+
+                    self.assertEqual(res1.status_code, 200)
+                    self.assertEqual(res2.status_code, 429)
+                    self.assertEqual(res2.json()["error"]["type"], "rate_limit_error")
+                    self.assertEqual(res2.headers.get("retry-after"), "10")
+
+        try:
+            asyncio.run(_run())
+        finally:
+            img_limiter.reset_limiter_state()
+
+    def test_stream_emits_queued_status_when_slot_busy(self):
+        import httpx
+        from httpx import ASGITransport
+        import app.core.image_limiter as img_limiter
+
+        async def fake_stream_fast(prompt, model=None, files=None, extra_dirs=None):
+            out = Path(extra_dirs[0]) / "out"
+            (out / "output-1.png").write_bytes(PNG_BYTES)
+            yield {"event": "result", "result": {"response": "done"}}
+
+        async def _run():
+            with (
+                patch.dict("os.environ", {"AGY_IMAGE_MAX_CONCURRENCY": "1", "AGY_IMAGE_QUEUE_TIMEOUT_S": "2.0"}),
+                patch("app.api.routes.POLL_INTERVAL_S", 0.05),
+                patch("app.api.routes.stream_agy_prompt", new=fake_stream_fast),
+            ):
+                img_limiter.reset_limiter_state()
+                sem = img_limiter.get_semaphore()
+                await sem.acquire()
+
+                # Release semaphore after 0.15s in background
+                async def delayed_release():
+                    await asyncio.sleep(0.15)
+                    sem.release()
+
+                asyncio.create_task(delayed_release())
+
+                transport = ASGITransport(app=_app())
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    res = await client.post(
+                        "/v1/images/generations",
+                        json={"prompt": "stream queued", "stream": True},
+                    )
+                    self.assertEqual(res.status_code, 200)
+                    frames = _sse_payloads(res.text)
+                    stages = [f.get("stage") for f in frames if isinstance(f, dict)]
+                    self.assertIn("started", stages)
+                    self.assertIn("queued", stages)
+                    self.assertIn("generating", stages)
+
+        try:
+            asyncio.run(_run())
+        finally:
+            img_limiter.reset_limiter_state()

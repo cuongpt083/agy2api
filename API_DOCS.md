@@ -187,6 +187,8 @@ Tạo hình ảnh AI dựa trên prompt văn bản (Text-to-Image) hoặc tạo 
 ```
 data: {"type":"status","stage":"started"}
 
+data: {"type":"status","stage":"queued","position":1}
+
 data: {"type":"status","stage":"generating"}
 
 data: {"type":"image","created":1786102966,"data":[{"url":"data:image/png;base64,...","b64_json":null}]}
@@ -194,6 +196,19 @@ data: {"type":"image","created":1786102966,"data":[{"url":"data:image/png;base64
 data: {"type":"done"}
 
 data: [DONE]
+```
+
+Lỗi quá tải / hết hàng đợi chờ (`AGY_IMAGE_MAX_CONCURRENCY`, `AGY_IMAGE_QUEUE_TIMEOUT_S`): không-stream trả **429** (`Retry-After: 10`); stream trả frame `type=error` rồi `done`.
+
+Không-stream **429**:
+
+```json
+{
+  "error": {
+    "message": "Server is busy. Image generation request timed out waiting for a free slot.",
+    "type": "rate_limit_error"
+  }
+}
 ```
 
 Lỗi không có file ảnh: không-stream trả **502**; stream trả frame `type=error` rồi `done`.

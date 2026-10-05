@@ -52,6 +52,50 @@ class TestCollectGeneratedImages(unittest.TestCase):
             self.assertTrue(os.path.isfile(paths[0]))
             self.assertEqual(Path(paths[0]).read_bytes(), PNG_BYTES)
 
+    def test_rejects_fallback_path_outside_workspace_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_root = os.path.join(tmp, "job")
+            out_dir = os.path.join(workspace_root, "out")
+            os.makedirs(out_dir)
+
+            # Stray image outside workspace root
+            outside_dir = os.path.join(tmp, "private")
+            os.makedirs(outside_dir)
+            sensitive_file = os.path.join(outside_dir, "secret.png")
+            Path(sensitive_file).write_bytes(PNG_BYTES)
+
+            paths = collect_generated_images(
+                out_dir,
+                agy_text=f"Check out {sensitive_file}",
+                n=1,
+                allowed_root=workspace_root,
+            )
+
+            # Should reject outside file and return empty
+            self.assertEqual(paths, [])
+
+    def test_rejects_sibling_prefix_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_root = os.path.join(tmp, "job-prefix")
+            out_dir = os.path.join(workspace_root, "out")
+            os.makedirs(out_dir)
+
+            # Sibling directory that starts with the same string prefix ("job-prefix-extra")
+            sibling_dir = os.path.join(tmp, "job-prefix-extra")
+            os.makedirs(sibling_dir)
+            sibling_file = os.path.join(sibling_dir, "stray.png")
+            Path(sibling_file).write_bytes(PNG_BYTES)
+
+            paths = collect_generated_images(
+                out_dir,
+                agy_text=f"Check out {sibling_file}",
+                n=1,
+                allowed_root=workspace_root,
+            )
+
+            # Should reject because commonpath is not workspace_root
+            self.assertEqual(paths, [])
+
 
 class TestEncodeImageObjects(unittest.TestCase):
     def test_url_format_uses_data_uri_with_jpeg_mime(self):

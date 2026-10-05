@@ -57,6 +57,13 @@ from app.core.image_generation import (
     snapshot_image_sizes,
     stable_output_images,
 )
+from app.core.image_limiter import (
+    POLL_INTERVAL_S,
+    ImageSlotAcquisition,
+    get_image_queue_timeout,
+    get_image_waiting_count,
+    get_semaphore,
+)
 from app.core.metrics import (
     record_chat_completion,
     record_image_generation,
@@ -615,12 +622,53 @@ async def _sse_image_generation(
     n: int,
 ):
     yield format_sse({"type": "status", "stage": "started"})
+
+    timeout_s = get_image_queue_timeout()
+    loop = asyncio.get_running_loop()
+    sem = get_semaphore()
+    deadline = loop.time() + timeout_s
+
+    # Acquire semaphore cleanly using a single long-lived task polled with asyncio.wait
+    # to avoid cancelling and leaking semaphore permits in Python 3.10+
+    acquired = False
+    acquire_future = asyncio.ensure_future(sem.acquire())
+    try:
+        while not acquired:
+            time_left = deadline - loop.time()
+            if time_left <= 0:
+                acquire_future.cancel()
+                if acquire_future.done() and not acquire_future.cancelled() and not acquire_future.exception():
+                    sem.release()
+                yield format_sse(_image_error_payload("Server is busy. Image generation request timed out waiting for a free slot."))
+                yield format_sse({"type": "done"})
+                yield format_sse("[DONE]")
+                workspace.cleanup()
+                return
+
+            poll_duration = min(time_left, POLL_INTERVAL_S)
+            done, _ = await asyncio.wait({acquire_future}, timeout=poll_duration)
+            if acquire_future in done:
+                if acquire_future.cancelled() or acquire_future.exception():
+                    raise acquire_future.exception() or asyncio.CancelledError()
+                acquired = True
+            else:
+                waiting = get_image_waiting_count()
+                yield format_sse({"type": "status", "stage": "queued", "position": waiting})
+    except (asyncio.CancelledError, GeneratorExit):
+        if not acquire_future.done():
+            acquire_future.cancel()
+        elif not acquire_future.cancelled() and not acquire_future.exception():
+            sem.release()
+        workspace.cleanup()
+        raise
+
     yield format_sse({"type": "status", "stage": "generating"})
     prev_sizes: dict[str, int] = {}
     last_text = ""
     emitted = False
-    agen = stream_agy_prompt(prompt=prompt, model=req.model, extra_dirs=[workspace.root])
+    agen = None
     try:
+        agen = stream_agy_prompt(prompt=prompt, model=req.model, extra_dirs=[workspace.root])
         while True:
             event = None
             try:
@@ -643,7 +691,7 @@ async def _sse_image_generation(
                 emitted = True
                 break
         if not emitted:
-            paths = collect_generated_images(workspace.out_dir, last_text, n)
+            paths = collect_generated_images(workspace.out_dir, last_text, n, allowed_root=workspace.root)
             if not paths:
                 yield format_sse(_image_error_payload("AGY did not produce an image file."))
             else:
@@ -661,10 +709,13 @@ async def _sse_image_generation(
         yield format_sse({"type": "done"})
         yield format_sse("[DONE]")
     finally:
-        try:
-            await agen.aclose()
-        except Exception:
-            pass
+        if agen is not None:
+            try:
+                await agen.aclose()
+            except Exception:
+                pass
+        if acquired:
+            sem.release()
         workspace.cleanup()
 
 
@@ -686,11 +737,25 @@ async def generate_image(req: ImageGenerationRequest, background_tasks: Backgrou
 
     background_tasks.add_task(workspace.cleanup)
     try:
-        agy_response = await run_agy_prompt(
-            prompt=prompt,
-            model=req.model,
-            output_format="json",
-            extra_dirs=[workspace.root],
+        async with ImageSlotAcquisition():
+            agy_response = await run_agy_prompt(
+                prompt=prompt,
+                model=req.model,
+                output_format="json",
+                extra_dirs=[workspace.root],
+            )
+    except asyncio.TimeoutError:
+        record_image_generation("error")
+        logger.warning("Image generation queue timeout exceeded.")
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": "10"},
+            content={
+                "error": {
+                    "message": "Server is busy. Image generation request timed out waiting for a free slot.",
+                    "type": "rate_limit_error",
+                }
+            },
         )
     except Exception as e:
         record_image_generation("error")
@@ -704,6 +769,7 @@ async def generate_image(req: ImageGenerationRequest, background_tasks: Backgrou
         workspace.out_dir,
         agy_text_from_response(agy_response),
         n,
+        allowed_root=workspace.root,
     )
     if not paths:
         record_image_generation("error")
